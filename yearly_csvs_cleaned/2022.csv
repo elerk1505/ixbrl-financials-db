@@ -1,0 +1,28 @@
+run_code,company_id,date,file_type,taxonomy,balance_sheet_date,companies_house_registered_number,entity_current_legal_name,company_dormant,average_number_employees_during_period,period_start,period_end,tangible_fixed_assets,debtors,cash_bank_in_hand,current_assets,creditors_due_within_one_year,creditors_due_after_one_year,net_current_assets_liabilities,total_assets_less_current_liabilities,net_assets_liabilities_including_pension_asset_liability,called_up_share_capital,profit_loss_account_reserve,shareholder_funds,turnover_gross_operating_revenue,other_operating_income,cost_sales,gross_profit_loss,administrative_expenses,raw_materials_consumables,staff_costs,depreciation_other_amounts_written_off_tangible_intangible_fixed_assets,other_operating_charges_format2,operating_profit_loss,profit_loss_on_ordinary_activities_before_tax,tax_on_profit_or_loss_on_ordinary_activities,profit_loss_for_period,error,zip_url,year
+Prod223_4022,05866026,2022-12-31,html,,2022-12-31,05866026,NICHE MARINE MARKETING LIMITED,False,0.03,2022-12-31,2022-12-31,8300,,,406447,,,89467,97767,74127,,,74127,,,,,,,,,,,,,,,,2022
+Prod223_4022,05866026,2022-12-31,html,,2022-12-31,05866026,NICHE MARINE MARKETING LIMITED,False,0.03,2021-12-31,2021-12-31,20085,,,257484,,,92706,112791,19003,,,19003,,,,,,,,,,,,,,,,2022
+Prod223_4022,07723116,2022-07-31,html,,2022-07-31,07723116,PRESTIGE VENTURES LIMITED,True,,2022-07-31,2022-07-31,,,,,,,,,1000,,,1000,,,,,,,,,,,,,,,,2022
+Prod223_4022,07723116,2022-07-31,html,,2022-07-31,07723116,PRESTIGE VENTURES LIMITED,True,,2021-07-31,2021-07-31,,,,,,,,,1000,,,1000,,,,,,,,,,,,,,,,2022
+Prod223_4022,08799891,2022-12-31,html,,2022-12-31,08799891,RED TOP PROPERTIES LIMITED,False,1,2022-12-31,2022-12-31,,362222,1,362223,,,-326116,1281495,-71518,,,1,,,,,,,,,,,,,,,,2022
+Prod223_4022,08799891,2022-12-31,html,,2022-12-31,08799891,RED TOP PROPERTIES LIMITED,False,1,2021-12-31,2021-12-31,,288259,47949,336208,,,-345083,1262528,-40093,,,1,,,,,,,,,,,,,,,,2022
+Prod223_4022,09020368,2022-12-31,html,,2022-12-31,9020368,SCALLET SOLUTIONS LIMITED,False,0,2022-12-31,2022-12-31,,38069,5504,43573,,,43573,43573,10837,,,1,,,,,,,,,,,,,,,,2022
+Prod223_4022,09976188,2022-01-31,html,,2022-01-31,09976188,KALAN LIMITED,True,,2022-01-31,2022-01-31,,,,,,,,,1,,,1,,,,,,,,,,,,,,,,2022
+Prod223_4022,09976188,2022-01-31,html,,2022-01-31,09976188,KALAN LIMITED,True,,2021-01-31,2021-01-31,,,,,,,,,1,,,1,,,,,,,,,,,,,,,,2022
+Prod223_4022,10797396,2022-06-30,html,,2022-06-30,10797396,Hampshire Events And Catering Limited,False,2,2022-06-30,2022-06-30,3480,,,6440,11748,,-5010,-1530,-14444,,,-14444,,,,,,,,,,,,,,,,2022
+Prod223_4022,10797396,2022-06-30,html,,2022-06-30,10797396,Hampshire Events And Catering Limited,False,2,2021-06-30,2021-06-30,5094,,,2691,18001,,-15310,-10216,-24934,,,-24934,,,,,,,,,,,,,,,,2022
+Prod223_4022,11684029,2022-11-30,html,,2022-11-30,11684029,Benson Property Management Services Limited,False,,2022-11-30,2022-11-30,8077383,,,140018,,,-3382508,4694875,4681575,,,4681575,,,,,,,,,,,,,,,,2022
+Prod223_4022,11684029,2022-11-30,html,,2022-11-30,11684029,Benson Property Management Services Limited,False,,2021-11-30,2021-11-30,8077383,,,353432,,,-3422062,4655321,4645021,,,4645021,,,,,,,,,,,,,,,,2022
+Prod223_4022,11875845,2022-12-31,html,,2022-12-31,11875845,T4C CONTRACTORS LTD,True,0,2022-12-31,2022-12-31,0,,,0,0,,0,0,0,,,0,,,,,,,,,,,,,,,,2022
+Prod223_4022,11875845,2022-12-31,html,,2022-12-31,11875845,T4C CONTRACTORS LTD,True,0,2021-12-31,2021-12-31,0,,,0,0,,0,0,0,,,0,,,,,,,,,,,,,,,,2022
+Prod223_4022,11913501,2022-03-31,html,,2022-03-31,11913501,BANDAMO SOLUTIONS LTD,True,0,2022-03-31,2022-03-31,,,,0,0,,0,0,0,,,0,,,,,,,,,,,,,,,,2022
+Prod223_4022,11913501,2022-03-31,html,,2022-03-31,11913501,BANDAMO SOLUTIONS LTD,True,0,2021-03-31,2021-03-31,,,,0,0,,0,0,0,,,0,,,,,,,,,,,,,,,,2022
+Prod223_4022,11966262,2022-10-31,html,,2022-10-31,11966262,HOLLSCOPE SOLUTIONS LIMITED,True,,2022-10-31,2022-10-31,,,1,,,,,,1,,,1,,,,,,,,,,,,,,,,2022
+Prod223_4022,11966262,2022-10-31,html,,2022-10-31,11966262,HOLLSCOPE SOLUTIONS LIMITED,True,,2021-10-31,2021-10-31,,,1,,,,,,1,,,1,,,,,,,,,,,,,,,,2022
+Prod223_4022,12341805,2022-12-31,html,,2022-12-31,12341805,TO AND FROM LTD,True,,2022-12-31,2022-12-31,,,,,,,,,2,,,2,,,,,,,,,,,,,,,,2022
+Prod223_4022,12341805,2022-12-31,html,,2022-12-31,12341805,TO AND FROM LTD,True,,2021-12-31,2021-12-31,,,,,,,,,2,,,2,,,,,,,,,,,,,,,,2022
+Prod223_4022,12719076,2022-07-31,html,,2022-07-31,12719076,BROKEN WHISPERS COMMUNITY INTEREST COMPANY,False,0,2022-07-31,2022-07-31,0,0,0,0,0,,0,0,0,,0,0,,,,,,,,,,,,,,,,2022
+Prod223_4022,12719076,2022-07-31,html,,2022-07-31,12719076,BROKEN WHISPERS COMMUNITY INTEREST COMPANY,False,0,2021-07-31,2021-07-31,0,0,0,0,0,,0,0,0,,0,0,,,,,,,,,,,,,,,,2022
+Prod223_4022,12789344,2022-08-31,html,,2022-08-31,12789344,MYLO ESTATES LTD,True,,2022-08-31,2022-08-31,,,,,,,,,100,,,100,,,,,,,,,,,,,,,,2022
+Prod223_4022,12789344,2022-08-31,html,,2022-08-31,12789344,MYLO ESTATES LTD,True,,2021-08-31,2021-08-31,,,,,,,,,100,,,100,,,,,,,,,,,,,,,,2022
+Prod223_4022,12963070,2022-10-31,html,,2022-10-31,12963070,OLIVE AND SAGE LIMITED,True,,2022-10-31,2022-10-31,,,,,,,,,2,,,2,,,,,,,,,,,,,,,,2022
+Prod223_4022,12963070,2022-10-31,html,,2022-10-31,12963070,OLIVE AND SAGE LIMITED,True,,2021-10-31,2021-10-31,,,,,,,,,2,,,2,,,,,,,,,,,,,,,,2022
