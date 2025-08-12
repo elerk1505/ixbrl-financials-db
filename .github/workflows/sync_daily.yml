@@ -1,3 +1,6 @@
+permissions:
+  contents: write
+
 name: Daily iXBRL Sync
 
 on:
@@ -29,7 +32,6 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git pull --rebase
           git add .
           git commit -m "Auto-update latest iXBRL data" || echo "No changes to commit"
-          git push origin main
+          push https://x-access-token:${{ secrets.GH_TOKEN }}@github.com/elerk1505/ixbrl-financials-db.git HEAD:main
