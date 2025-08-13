@@ -1,10 +1,10 @@
-# .github/workflows/sync-metadata.yml
+# .github/workflows/sync_metadata.yml
 name: Daily Company Metadata Sync
 
 on:
   schedule:
-    - cron: "15 1 * * *"   # Daily at 01:15 UTC (02:15 London during BST)
-  workflow_dispatch: {}
+    - cron: "15 1 * * *"   # Daily at 01:15 UTC (02:15 during BST)
+  workflow_dispatch: {}     # <-- keeps the "Run workflow" button
 
 permissions:
   contents: write
@@ -17,13 +17,20 @@ jobs:
       group: sync-metadata
       cancel-in-progress: false
 
-    # Env at the job level applies to all steps
+    # Available to all steps
     env:
+      # Companies House API key you already store as CH_API_KEY
       COMPANIES_HOUSE_API_KEY: ${{ secrets.CH_API_KEY }}
+
+      # Pacing & chunking
       TARGET_RPS: "2.0"
       MAX_REQUESTS_PER_RUN: "9000"
       REQUEST_TIMEOUT: "20"
       BATCH_FLUSH: "200"
+
+      # Make the ID discovery match your repo layout:
+      # - yearly_csvs_cleaned/*.csv (folder with year files)
+      # - *.csv (top-level year files, if any)
 
     steps:
       - name: Checkout repo
@@ -32,7 +39,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          python-version: "3.10"
 
       - name: Install dependencies
         run: pip install httpx pandas
@@ -40,14 +47,16 @@ jobs:
       - name: Run metadata sync
         run: python sync_company_metadata.py
 
-     - name: Commit and push updates
-      run: |
-      git config user.name "github-actions[bot]"
-      git config user.email "github-actions[bot]@users.noreply.github.com"
+      - name: Commit and push updates
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-      # Safely rebase on latest remote even if local files changed
-      git pull --rebase --autostash || true
-  
-      git add -A
-      git commit -m "Auto-update company metadata" || echo "No changes to commit"
-      git push https://x-access-token:${{ secrets.GH_TOKEN }}@github.com/${{ github.repository }} HEAD:main
+          # Safely rebase even if this job created/modified files
+          git pull --rebase --autostash || true
+
+          git add -A
+          git commit -m "Auto-update company metadata" || echo "No changes to commit"
+
+          # Use your repo secret named GH_TOKEN
+          git push https://x-access-token:${{ secrets.GH_TOKEN }}@github.com/${{ github.repository }} HEAD:main
