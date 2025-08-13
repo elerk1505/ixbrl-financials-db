@@ -29,6 +29,9 @@ def load_existing_metadata(path="company_metadata.csv"):
 # Fetch metadata from Companies House API
 def fetch_metadata(company_number):
     url = API_URL + company_number
+    if not API_KEY:
+        raise ValueError("Missing Companies House API key. Make sure CH_API_KEY is set in GitHub Secrets.")
+    
     r = httpx.get(url, auth=(API_KEY, ""))
     if r.status_code == 200:
         data = r.json()
