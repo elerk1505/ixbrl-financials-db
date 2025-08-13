@@ -3,8 +3,7 @@ name: Daily Company Metadata Sync
 
 on:
   schedule:
-    # Daily at 01:15 UTC (02:15 London during BST)
-    - cron: "15 1 * * *"
+    - cron: "15 1 * * *"   # Daily at 01:15 UTC (02:15 London during BST)
   workflow_dispatch: {}
 
 permissions:
@@ -18,13 +17,14 @@ jobs:
       group: sync-metadata
       cancel-in-progress: false
 
+    # Env at the job level applies to all steps
     env:
-      # Map your existing secret name to what the script expects
       COMPANIES_HOUSE_API_KEY: ${{ secrets.CH_API_KEY }}
-      TARGET_RPS: "2.0"              # ~2 req/sec to stay under CH pacing
-      MAX_REQUESTS_PER_RUN: "9000"   # chew through backlog daily
+      TARGET_RPS: "2.0"
+      MAX_REQUESTS_PER_RUN: "9000"
       REQUEST_TIMEOUT: "20"
       BATCH_FLUSH: "200"
+      IDS_SOURCES: "financials/**/*.csv;sqlite_db/**/*.sqlite"  # optional speed-up
 
     steps:
       - name: Checkout repo
@@ -36,7 +36,7 @@ jobs:
           python-version: '3.10'
 
       - name: Install dependencies
-        run: pip install httpx
+        run: pip install httpx pandas
 
       - name: Run metadata sync
         run: python sync_company_metadata.py
@@ -45,6 +45,7 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
+          git pull --rebase
           git add company_metadata.csv sync_metadata.progress.json || true
           git commit -m "Auto-update company metadata" || echo "No changes to commit"
           git push https://x-access-token:${{ secrets.GH_TOKEN }}@github.com/${{ github.repository }} HEAD:main
