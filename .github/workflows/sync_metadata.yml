@@ -11,6 +11,8 @@ permissions:
 jobs:
   sync-metadata:
     runs-on: ubuntu-latest
+    env:
+      CH_API_KEY: ${{ secrets.CH_API_KEY }}
 
     steps:
       - name: Checkout repo
