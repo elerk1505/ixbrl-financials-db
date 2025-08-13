@@ -4,6 +4,158 @@ from pathlib import Path
 from datetime import datetime, timezone
 import httpx
 
+# --- add these near the top (after imports) ---
+import sqlite3
+import glob
+
+ID_COLS = [
+    "companies_house_registered_number",
+    "company_number",
+    "companyNumber",
+    "company_id",
+    "companies_house_registered_no",
+    "ch_number",
+]
+
+def _read_ids_from_csv(path):
+    import pandas as pd
+    try:
+        # Try to read only the first matching column
+        for col in ID_COLS:
+            try:
+                s = pd.read_csv(path, usecols=[col], dtype=str)
+                return [x.strip() for x in s[col].dropna().astype(str).tolist()]
+            except ValueError:
+                continue
+        # Fallback: first column
+        s = pd.read_csv(path, usecols=[0], header=0, dtype=str)
+        first_col = s.columns[0]
+        vals = s[first_col].dropna().astype(str).tolist()
+        # Skip header‑like values
+        if first_col.lower() in ID_COLS:
+            return [v.strip() for v in vals]
+        return [v.strip() for v in vals if v.lower() not in ID_COLS]
+    except Exception:
+        return []
+
+def _read_ids_from_sqlite(path, max_rows=10_000_000):
+    ids = []
+    try:
+        con = sqlite3.connect(path)
+        cur = con.cursor()
+        # Find tables that contain a CH‑like column
+        cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        tables = [r[0] for r in cur.fetchall()]
+        for t in tables:
+            # PRAGMA to find columns
+            cur.execute(f"PRAGMA table_info('{t}')")
+            cols = [r[1] for r in cur.fetchall()]
+            match = next((c for c in cols if c in ID_COLS), None)
+            if not match:
+                continue
+            # Stream out distinct IDs
+            try:
+                for row in cur.execute(f"SELECT DISTINCT {match} FROM '{t}' LIMIT {max_rows}"):
+                    if row and row[0]:
+                        ids.append(str(row[0]).strip())
+            except Exception:
+                continue
+    except Exception:
+        pass
+    finally:
+        try:
+            con.close()
+        except Exception:
+            pass
+    return ids
+
+def _discover_ids_from_repo(glob_spec):
+    """
+    glob_spec: semicolon‑separated globs, e.g. 'data/**/*.csv;*.sqlite'
+    """
+    patterns = [g.strip() for g in (glob_spec or "").split(";") if g.strip()]
+    if not patterns:
+        # sensible defaults for your repo layout (CSV‑first, then SQLite)
+        patterns = ["**/*.csv", "**/*.sqlite"]
+    found = []
+    seen = set()
+    for pat in patterns:
+        for path in glob.glob(pat, recursive=True):
+            if path.lower().endswith(".csv"):
+                for cid in _read_ids_from_csv(path):
+                    if cid and cid not in seen:
+                        seen.add(cid); found.append(cid)
+            elif path.lower().endswith(".sqlite") or path.lower().endswith(".db"):
+                for cid in _read_ids_from_sqlite(path):
+                    if cid and cid not in seen:
+                        seen.add(cid); found.append(cid)
+    return found
+
+def _load_existing_metadata_ids(output_csv_path):
+    # Remove already‑synced IDs so we don’t re‑request them
+    if not Path(output_csv_path).exists():
+        return set()
+    try:
+        import pandas as pd
+        # Read only the ID column; try the common names
+        for col in ["companies_house_registered_number"] + ID_COLS:
+            try:
+                s = pd.read_csv(output_csv_path, usecols=[col], dtype=str)
+                return set(s[col].dropna().astype(str).str.strip().tolist())
+            except ValueError:
+                continue
+    except Exception:
+        pass
+    return set()
+
+# --- replace your existing load_ids() with this ---
+def load_ids():
+    """
+    Priority:
+      1) If NEW_COMPANY_IDS_CSV exists -> use it (backwards compatible)
+      2) Else auto‑discover from repo using IDS_SOURCES glob(s)
+    After collection, subtract anything already present in OUTPUT_CSV or checkpoint.done
+    """
+    src_csv = os.environ.get("NEW_COMPANY_IDS_CSV", "new_company_ids.csv")
+    discovered = []
+
+    if Path(src_csv).exists():
+        print(f"📄 Using IDs from CSV: {src_csv}")
+        discovered = _read_ids_from_csv(src_csv)
+    else:
+        glob_spec = os.environ.get("IDS_SOURCES", "")  # e.g., "data/**/*.csv;**/*.sqlite"
+        print("🔎 No new_company_ids.csv — auto‑discovering IDs from repo…")
+        discovered = _discover_ids_from_repo(glob_spec)
+        print(f"🔎 Discovered {len(discovered)} potential company IDs from repo files")
+
+    # De‑dupe & normalise
+    norm = []
+    seen = set()
+    for cid in discovered:
+        if not cid:
+            continue
+        c = cid.strip()
+        if c and c not in seen:
+            seen.add(c)
+            norm.append(c)
+
+    # Remove already present in output CSV
+    already = _load_existing_metadata_ids(OUTPUT_CSV)
+
+    # Remove already done from checkpoint if present
+    done_map = {}
+    if Path(CHECKPOINT).exists():
+        try:
+            with open(CHECKPOINT, "r", encoding="utf-8") as f:
+                done_map = json.load(f).get("done", {}) or {}
+        except Exception:
+            pass
+    already.update(done_map.keys())
+
+    remaining = [c for c in norm if c not in already]
+    print(f"🧮 IDs total: {len(norm)} | already synced/skipped: {len(already)} | remaining: {len(remaining)}")
+    return remaining
+
 API_KEY = os.environ["COMPANIES_HOUSE_API_KEY"]  # set in workflow secrets
 INPUT_NEW_IDS_CSV = os.environ.get("NEW_COMPANY_IDS_CSV", "new_company_ids.csv")
 OUTPUT_CSV = os.environ.get("METADATA_OUT_CSV", "company_metadata.csv")
@@ -21,33 +173,6 @@ BASE_URL = "https://api.company-information.service.gov.uk/company/{}"
 HEADERS = {
     "User-Agent": "ixbrl-financials-db sync-metadata (GitHub Actions)"
 }
-
-def load_ids():
-    # Expect a CSV with a header and a column named 'company_id' or 'companies_house_registered_number'
-    # or a simple one-column CSV.
-    ids = []
-    with open(INPUT_NEW_IDS_CSV, newline="", encoding="utf-8") as f:
-        rdr = csv.DictReader(f)
-        if "company_id" in rdr.fieldnames:
-            ids = [r["company_id"].strip() for r in rdr if r.get("company_id")]
-        elif "companies_house_registered_number" in rdr.fieldnames:
-            ids = [r["companies_house_registered_number"].strip() for r in rdr if r.get("companies_house_registered_number")]
-        else:
-            # fallback: first column
-            f.seek(0)
-            simple = csv.reader(f)
-            for row in simple:
-                if not row: continue
-                val = row[0].strip()
-                if val.lower() in ("company_id", "companies_house_registered_number"):  # skip header
-                    continue
-                ids.append(val)
-    # de-dupe & keep order
-    seen = set(); out=[]
-    for cid in ids:
-        if cid and cid not in seen:
-            seen.add(cid); out.append(cid)
-    return out
 
 def load_checkpoint():
     if not Path(CHECKPOINT).exists():
