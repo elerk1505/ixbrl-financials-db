@@ -24,7 +24,6 @@ jobs:
       MAX_REQUESTS_PER_RUN: "9000"
       REQUEST_TIMEOUT: "20"
       BATCH_FLUSH: "200"
-      IDS_SOURCES: "financials/**/*.csv;sqlite_db/**/*.sqlite"  # optional speed-up
 
     steps:
       - name: Checkout repo
