@@ -40,11 +40,14 @@ jobs:
       - name: Run metadata sync
         run: python sync_company_metadata.py
 
-      - name: Commit and push updates
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git pull --rebase
-          git add company_metadata.csv sync_metadata.progress.json || true
-          git commit -m "Auto-update company metadata" || echo "No changes to commit"
-          git push https://x-access-token:${{ secrets.GH_TOKEN }}@github.com/${{ github.repository }} HEAD:main
+     - name: Commit and push updates
+      run: |
+      git config user.name "github-actions[bot]"
+      git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      # Safely rebase on latest remote even if local files changed
+      git pull --rebase --autostash || true
+  
+      git add -A
+      git commit -m "Auto-update company metadata" || echo "No changes to commit"
+      git push https://x-access-token:${{ secrets.GH_TOKEN }}@github.com/${{ github.repository }} HEAD:main
