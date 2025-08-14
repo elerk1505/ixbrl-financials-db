@@ -1,14 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Sync metadata for companies listed in yearly_csvs_cleaned/*.csv
+Sync metadata for companies listed in yearly_sqlites/*.sqlite (table: financials)
 
 What it does:
-1) Reads yearly CSVs (e.g., 2020.csv ... 2025.csv) under --input-dir (default: yearly_csvs_cleaned)
-2) Collects company numbers from any of these case-insensitive columns:
-   - company_id
-   - companies_house_registered_number
-   - company_number
+1) Scans per-year SQLite files under --input-dir (default: yearly_sqlites), e.g., 2020.sqlite … 2025.sqlite
+2) Collects DISTINCT company numbers from the 'financials' table (prefers 'company_number', falls back to 'companies_house_registered_number')
 3) Writes a deduped list to data/company_numbers.csv
 4) Fetches Companies House /company/{number} profiles for those IDs
 5) Stores results in data/company_metadata.sqlite, one row per company
@@ -16,7 +13,7 @@ What it does:
 
 Usage (local):
   export CH_API_KEY=YOUR_COMPANIES_HOUSE_API_KEY
-  python sync_yearly_company_metadata.py --input-dir yearly_csvs_cleaned --max-per-run 50000
+  python sync_yearly_company_metadata.py --input-dir yearly_sqlites --max-per-run 50000
 
 You can re-run anytime; it resumes automatically and only fetches missing rows (or use --since-days / --force).
 
@@ -40,7 +37,7 @@ import aiohttp
 DEFAULT_TIMEOUT = 20
 DEFAULT_CONCURRENCY = 8
 
-# SQLite
+# SQLite (metadata DB)
 CREATE_SQL = """
 CREATE TABLE IF NOT EXISTS company_profiles (
     company_number TEXT PRIMARY KEY,
@@ -67,46 +64,58 @@ def init_db(db_path: Path) -> sqlite3.Connection:
     conn.commit()
     return conn
 
-def find_id_column(fieldnames: List[str]) -> Optional[str]:
-    if not fieldnames:
-        return None
-    lc = {h.lower(): h for h in fieldnames}
-    for cand in ("company_id", "companies_house_registered_number", "company_number"):
-        if cand in lc:
-            return lc[cand]
-    return None
+# ---------- NEW: read company numbers from yearly_sqlites/*.sqlite ----------
 
-def collect_company_numbers(input_dir: Path, pattern: str = "*.csv") -> List[str]:
-    numbers: List[str] = []
+def collect_company_numbers_from_sqlites(input_dir: Path, table: str = "financials") -> List[str]:
+    """
+    Open each *.sqlite under input_dir and SELECT DISTINCT company numbers.
+    Prefers 'company_number'; falls back to 'companies_house_registered_number' if needed.
+    Normalizes: strip spaces, zfill to 8 digits.
+    """
     if not input_dir.exists():
         print(f"WARNING: input dir not found: {input_dir}")
-        return numbers
+        return []
 
-    # recurse through subfolders as well (supports nested layouts)
-    for csv_path in sorted(input_dir.rglob(pattern)):
+    numbers_set = set()
+    db_files = sorted(input_dir.glob("*.sqlite"))
+    if not db_files:
+        print(f"WARNING: no .sqlite files found in {input_dir}")
+        return []
+
+    for db in db_files:
         try:
-            with csv_path.open(newline="", encoding="utf-8") as f:
-                reader = csv.DictReader(f)
-                col = find_id_column(reader.fieldnames or [])
-                if not col:
-                    print(f"MISS (no ID column) {csv_path}")
+            with sqlite3.connect(db) as con:
+                cur = con.cursor()
+                # Detect available ID column
+                cols = {r[1].lower(): r[1] for r in cur.execute(f'PRAGMA table_info("{table}")')}
+                id_col = None
+                for cand in ("company_number", "companies_house_registered_number"):
+                    if cand in cols:
+                        id_col = cols[cand]
+                        break
+                if not id_col:
+                    print(f"MISS (no ID column) {db}::{table}")
                     continue
-                count_before = len(numbers)
-                for row in reader:
-                    v = (row.get(col) or "").strip().replace(" ", "")
-                    if v:
-                        numbers.append(v)
-                print(f"OK   (+{len(numbers)-count_before:>6} ids) {csv_path}")
+
+                # Use DISTINCT to minimize memory
+                for (raw,) in cur.execute(f'SELECT DISTINCT "{id_col}" FROM "{table}"'):
+                    if raw is None:
+                        continue
+                    v = str(raw).strip().replace(" ", "")
+                    if not v:
+                        continue
+                    # normalize to 8-digit numeric-ish IDs if possible
+                    if v.isdigit():
+                        v = v.zfill(8)
+                    numbers_set.add(v)
+                print(f"OK   (+{len(numbers_set):,} total ids) {db}")
         except Exception as e:
-            print(f"SKIP (error: {e}) {csv_path}")
-    # dedupe keeping order
-    seen = set()
-    deduped = []
-    for n in numbers:
-        if n not in seen:
-            deduped.append(n)
-            seen.add(n)
-    return deduped
+            print(f"SKIP (error reading {db}): {e}")
+
+    # deterministic order
+    return sorted(numbers_set)
+
+# ---------------------------------------------------------------------------
 
 def write_company_numbers_csv(numbers: List[str], out_csv: Path) -> None:
     out_csv.parent.mkdir(parents=True, exist_ok=True)
@@ -115,7 +124,7 @@ def write_company_numbers_csv(numbers: List[str], out_csv: Path) -> None:
         w.writerow(["company_number"])
         for n in numbers:
             w.writerow([n])
-    print(f"Wrote {len(numbers)} unique IDs -> {out_csv}")
+    print(f"Wrote {len(numbers):,} unique IDs -> {out_csv}")
 
 def existing_company_numbers(conn: sqlite3.Connection) -> set:
     cur = conn.execute("SELECT company_number FROM company_profiles")
@@ -207,9 +216,9 @@ async def fetch_many(api_key: str, numbers: List[str], db_path: Path, concurrenc
     conn.close()
 
 def main():
-    parser = argparse.ArgumentParser(description="Sync Companies House metadata from yearly CSVs.")
-    parser.add_argument("--input-dir", default="yearly_csvs_cleaned", help="Folder containing 2020.csv, 2021.csv, ...")
-    parser.add_argument("--pattern", default="*.csv", help="Glob pattern for yearly files (default: *.csv)")
+    parser = argparse.ArgumentParser(description="Sync Companies House metadata from yearly SQLites.")
+    parser.add_argument("--input-dir", default="yearly_sqlites", help="Folder containing per-year SQLite files (e.g., 2020.sqlite)")
+    parser.add_argument("--table", default="financials", help="Table name in each yearly SQLite file")
     parser.add_argument("--out-csv", default="data/company_numbers.csv", help="Output CSV of deduped company numbers")
     parser.add_argument("--db", default="data/company_metadata.sqlite", help="SQLite DB path for cached profiles")
     parser.add_argument("--max-per-run", type=int, default=None, help="Limit how many NEW/stale companies to fetch this run")
@@ -227,10 +236,10 @@ def main():
     out_csv = Path(args.out_csv)
     db_path = Path(args.db)
 
-    # 1) Collect & write company_numbers.csv
-    numbers = collect_company_numbers(input_dir, pattern=args.pattern)
+    # 1) Collect & write company_numbers.csv (from yearly_sqlites/*.sqlite)
+    numbers = collect_company_numbers_from_sqlites(input_dir=input_dir, table=args.table)
     if not numbers:
-        print("No company IDs found in input CSVs.")
+        print("No company IDs found in yearly_sqlites.")
     write_company_numbers_csv(numbers, out_csv)
 
     # 2) Decide which numbers to fetch
@@ -246,11 +255,10 @@ def main():
     if args.max_per_run is not None:
         to_fetch = to_fetch[: args.max_per_run]
 
-    print(f"Totals — in yearly CSVs: {len(numbers)} | already in DB: {len(existing)} | stale: {len(stale)} | fetching now: {len(to_fetch)}")
+    print(f"Totals — in yearly SQLites: {len(numbers):,} | already in DB: {len(existing):,} | stale: {len(stale):,} | fetching now: {len(to_fetch):,}")
     conn.close()
 
     if to_fetch:
-        import asyncio
         asyncio.run(fetch_many(api_key, to_fetch, db_path, args.concurrency, args.timeout))
         print("Fetch complete.")
     else:
