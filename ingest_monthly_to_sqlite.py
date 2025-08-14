@@ -2,29 +2,31 @@
 # -*- coding: utf-8 -*-
 
 """
-Ingest Companies House Monthly Accounts ZIPs into yearly_sqlites/<YEAR>.sqlite
+Ingest Companies House Accounts monthly/annual ZIPs into yearly_sqlites/<YEAR>.sqlite
 
-Usage (examples):
-  # Your full range from Jan 2023 to Jun 2025 (inclusive)
-  python ingest_monthly_to_sqlite.py --start 2023-01 --end 2025-06
+Run a whole year:
+  python ingest_monthly_to_sqlite.py --year 2025
+  python ingest_monthly_to_sqlite.py --year 2024
+  python ingest_monthly_to_sqlite.py --year 2009
 
-  # Just 2024-06 to 2025-06 (inclusive)
+Or a month range:
   python ingest_monthly_to_sqlite.py --start 2024-06 --end 2025-06
 
 Notes:
-- Tries https://download.companieshouse.gov.uk/Accounts_Monthly_Data-<MonthName><YYYY>.zip
-  and falls back to https://download.companieshouse.gov.uk/archive/Accounts_Monthly_Data-<MonthName><YYYY>.zip
-- Writes per-year SQLite DBs under yearly_sqlites/<YEAR>.sqlite, table "financials".
+- For 2008 & 2009, Companies House provides one annual archive:
+    https://download.companieshouse.gov.uk/archive/Accounts_Monthly_Data-JanuaryToDecember2009.zip
+    https://download.companieshouse.gov.uk/archive/Accounts_Monthly_Data-JanuaryToDecember2008.zip
+- For 2010–2024, monthly ZIPs live under /archive/, e.g. .../archive/Accounts_Monthly_Data-June2024.zip
+- For 2025+, the current months are on the main path (non-archive) with fallback to /archive/.
+- Idempotent: UPSERT on (company_number, period_end) – re-runs won’t duplicate.
 """
 
 import argparse
 import calendar
-import json
-import sys
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Iterable, List, Tuple
+from typing import Iterable, List, Tuple, Optional
 
 import httpx
 import pandas as pd
@@ -37,14 +39,13 @@ from stream_read_xbrl import stream_read_xbrl_zip
 OUTPUT_DIR = Path("yearly_sqlites")
 TABLE_NAME = "financials"
 BATCH_ROWS = 200_000
-HTTP_TIMEOUT = 120.0
+HTTP_TIMEOUT = 180.0
 
 MONTH_NAMES = {i: calendar.month_name[i] for i in range(1, 13)}  # 1->'January', ...
 
 # -----------------------------
 # SQLite helpers (UPSERT logic)
 # -----------------------------
-
 
 def normalize_df(df: pd.DataFrame) -> pd.DataFrame:
     # company_number
@@ -60,7 +61,6 @@ def normalize_df(df: pd.DataFrame) -> pd.DataFrame:
             break
 
     return df
-
 
 def upsert_df_into_year_db(df: pd.DataFrame, db_path: Path, table: str = TABLE_NAME) -> None:
     """UPSERT a DataFrame into a per-year SQLite DB."""
@@ -107,11 +107,9 @@ def upsert_df_into_year_db(df: pd.DataFrame, db_path: Path, table: str = TABLE_N
             cur.execute(f'CREATE INDEX IF NOT EXISTS ix_{table}_period ON "{table}"(period_end)')
         con.commit()
 
-
 # -----------------------------
-# Month iteration + download
+# Month iteration + URL logic
 # -----------------------------
-
 
 @dataclass(frozen=True)
 class YearMonth:
@@ -130,7 +128,6 @@ class YearMonth:
             y, m = y + 1, 1
         return YearMonth(y, m)
 
-
 def iter_months_inclusive(start: YearMonth, end: YearMonth) -> Iterable[YearMonth]:
     cur = start
     while True:
@@ -138,7 +135,6 @@ def iter_months_inclusive(start: YearMonth, end: YearMonth) -> Iterable[YearMont
         if cur.year == end.year and cur.month == end.month:
             break
         cur = cur.next()
-
 
 def monthly_urls(ym: YearMonth) -> List[str]:
     disp = ym.to_display_name()  # e.g., "June2025"
@@ -148,92 +144,135 @@ def monthly_urls(ym: YearMonth) -> List[str]:
         f"https://download.companieshouse.gov.uk/archive/Accounts_Monthly_Data-{disp}.zip",
     ]
 
+def annual_archive_url_2008_2009(year: int) -> str:
+    # e.g. .../archive/Accounts_Monthly_Data-JanuaryToDecember2009.zip
+    return f"https://download.companieshouse.gov.uk/archive/Accounts_Monthly_Data-JanuaryToDecember{year}.zip"
 
-def fetch_and_ingest_month(ym: YearMonth, batch_rows: int = BATCH_ROWS, timeout: float = HTTP_TIMEOUT) -> Tuple[int, int]:
+# -----------------------------
+# Download + ingest
+# -----------------------------
+
+def process_zip_from_urls(urls: List[str], batch_rows: int = BATCH_ROWS, timeout: float = HTTP_TIMEOUT) -> Tuple[int, set]:
     """
-    Downloads one month's ZIP (trying main then archive), parses rows in batches,
-    and upserts them into yearly_sqlites/<YEAR>.sqlite.
-
-    Returns: (rows_ingested, years_touched)
+    Try a list of candidate URLs (first that works wins). Stream, parse, and upsert.
+    Returns (rows_ingested, years_touched)
     """
-    rows_ingested = 0
-    years_touched = set()
-    last_err = None
-
-    for url in monthly_urls(ym):
-        print(f"📦 Fetching {ym} → {url}")
+    last_err: Optional[Exception] = None
+    for url in urls:
+        print(f"📦 Fetching → {url}")
         try:
             with httpx.stream("GET", url, timeout=timeout) as r:
                 r.raise_for_status()
-                # Stream rows → batch → DataFrame → upsert
                 buffer = []
-                columns = None
-                with stream_read_xbrl_zip(r.iter_bytes()) as (cols, row_iter):
-                    columns = cols
+                years_touched = set()
+                rows_ingested = 0
+                with stream_read_xbrl_zip(r.iter_bytes()) as (columns, row_iter):
                     for row in row_iter:
-                        # normalize to strings for stability; keep None if you prefer
                         buffer.append([("" if v is None else str(v)) for v in row])
                         if len(buffer) >= batch_rows:
-                            df = pd.DataFrame(buffer, columns=columns)
-                            # determine years from balance_sheet_date
-                            df["balance_sheet_date"] = pd.to_datetime(df["balance_sheet_date"], errors="coerce")
-                            df = df.dropna(subset=["balance_sheet_date"])
-                            if df.empty:
-                                buffer.clear()
-                                continue
-                            df["year"] = df["balance_sheet_date"].dt.year
-                            for year, df_year in df.groupby("year"):
-                                out_db = OUTPUT_DIR / f"{int(year)}.sqlite"
-                                upsert_df_into_year_db(df_year, out_db)
-                                years_touched.add(int(year))
-                            rows_ingested += len(df)
+                            rows_ingested += _flush_batch(buffer, columns, years_touched)
                             buffer.clear()
-
                     # flush remainder
                     if buffer:
-                        df = pd.DataFrame(buffer, columns=columns)
-                        df["balance_sheet_date"] = pd.to_datetime(df["balance_sheet_date"], errors="coerce")
-                        df = df.dropna(subset=["balance_sheet_date"])
-                        if not df.empty:
-                            df["year"] = df["balance_sheet_date"].dt.year
-                            for year, df_year in df.groupby("year"):
-                                out_db = OUTPUT_DIR / f"{int(year)}.sqlite"
-                                upsert_df_into_year_db(df_year, out_db)
-                                years_touched.add(int(year))
-                            rows_ingested += len(df)
+                        rows_ingested += _flush_batch(buffer, columns, years_touched)
                         buffer.clear()
-                print(f"✅ {ym}: upserted {rows_ingested:,} rows across {len(years_touched)} year DB(s)")
-                return rows_ingested, len(years_touched)
+                print(f"✅ Upserted {rows_ingested:,} rows across {len(years_touched)} year DB(s)")
+                return rows_ingested, years_touched
         except httpx.HTTPStatusError as e:
-            # try next URL (maybe in archive)
             last_err = e
-            print(f"  ↪️ HTTP {e.response.status_code} for {url}, trying fallback...")
+            print(f"  ↪️ HTTP {e.response.status_code} for {url}, trying fallback…")
             continue
         except Exception as e:
             last_err = e
-            print(f"  ❌ Error for {url}: {e}")
+            print(f"  ❌ Error for {url}: {e}, trying fallback…")
             continue
+    print(f"❌ Could not fetch any URL. Last error: {last_err}")
+    return 0, set()
 
-    print(f"❌ Failed to fetch {ym} from main or archive. Last error: {last_err}")
-    return 0, 0
-
+def _flush_batch(buffer: List[List[str]], columns: List[str], years_touched: set) -> int:
+    df = pd.DataFrame(buffer, columns=columns)
+    # Determine target year(s) from balance_sheet_date
+    df["balance_sheet_date"] = pd.to_datetime(df["balance_sheet_date"], errors="coerce")
+    df = df.dropna(subset=["balance_sheet_date"])
+    if df.empty:
+        return 0
+    df["year"] = df["balance_sheet_date"].dt.year
+    total = 0
+    for year, df_year in df.groupby("year"):
+        out_db = OUTPUT_DIR / f"{int(year)}.sqlite"
+        upsert_df_into_year_db(df_year, out_db)
+        years_touched.add(int(year))
+        total += len(df_year)
+    return total
 
 # -----------------------------
 # CLI
 # -----------------------------
 
-
 def parse_args():
-    ap = argparse.ArgumentParser(description="Ingest Companies House Monthly Accounts into yearly SQLite DBs")
-    ap.add_argument("--start", required=True, help="Start month in YYYY-MM (e.g., 2023-01)")
-    ap.add_argument("--end", required=True, help="End month in YYYY-MM (inclusive, e.g., 2025-06)")
+    ap = argparse.ArgumentParser(description="Ingest Companies House Accounts into yearly SQLite DBs")
+    mode = ap.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--year", type=int, help="Ingest a whole year (e.g., 2025, 2024, … 2008)")
+    mode.add_argument("--start", help="Start month in YYYY-MM (e.g., 2023-01)")
+    ap.add_argument("--end", help="End month in YYYY-MM (inclusive, e.g., 2025-06)")
     ap.add_argument("--batch-rows", type=int, default=BATCH_ROWS, help="Rows per batch to upsert (default 200k)")
-    ap.add_argument("--timeout", type=float, default=HTTP_TIMEOUT, help="HTTP timeout seconds (default 120)")
+    ap.add_argument("--timeout", type=float, default=HTTP_TIMEOUT, help="HTTP timeout seconds (default 180)")
     return ap.parse_args()
 
+def ingest_year(year: int, batch_rows: int, timeout: float) -> None:
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    # 2008/2009: one annual ZIP
+    if year in (2008, 2009):
+        url = annual_archive_url_2008_2009(year)
+        print(f"⏳ Ingesting annual archive for {year}")
+        process_zip_from_urls([url], batch_rows=batch_rows, timeout=timeout)
+        return
+
+    # 2010–2024: monthly ZIPs in /archive/
+    if 2010 <= year <= 2024:
+        for m in range(1, 13):
+            ym = YearMonth(year, m)
+            urls = [f"https://download.companieshouse.gov.uk/archive/Accounts_Monthly_Data-{ym.to_display_name()}.zip"]
+            print(f"⏳ Ingesting {ym}")
+            process_zip_from_urls(urls, batch_rows=batch_rows, timeout=timeout)
+        return
+
+    # 2025+: monthly ZIPs: try main path then archive
+    if year >= 2025:
+        # Attempt months up to current month if it's the current year; otherwise all 12
+        last_month = 12
+        now = datetime.utcnow()
+        if year == now.year:
+            last_month = now.month
+        for m in range(1, last_month + 1):
+            ym = YearMonth(year, m)
+            urls = [
+                f"https://download.companieshouse.gov.uk/Accounts_Monthly_Data-{ym.to_display_name()}.zip",
+                f"https://download.companieshouse.gov.uk/archive/Accounts_Monthly_Data-{ym.to_display_name()}.zip",
+            ]
+            print(f"⏳ Ingesting {ym}")
+            process_zip_from_urls(urls, batch_rows=batch_rows, timeout=timeout)
+        return
+
+    # Fallback for any other year (treat like 2010–2024)
+    for m in range(1, 13):
+        ym = YearMonth(year, m)
+        urls = [f"https://download.companieshouse.gov.uk/archive/Accounts_Monthly_Data-{ym.to_display_name()}.zip"]
+        print(f"⏳ Ingesting {ym}")
+        process_zip_from_urls(urls, batch_rows=batch_rows, timeout=timeout)
 
 def main():
     args = parse_args()
+    if args.year:
+        ingest_year(args.year, batch_rows=args.batch_rows, timeout=args.timeout)
+        print("✅ Done.")
+        return 0
+
+    # month range mode
+    if not args.end:
+        print("When using --start, you must also provide --end (e.g., --start 2024-06 --end 2025-06)")
+        return 2
 
     try:
         start_dt = datetime.strptime(args.start, "%Y-%m")
@@ -241,23 +280,22 @@ def main():
     except ValueError:
         print("Start/End must be in YYYY-MM format, e.g., --start 2023-01 --end 2025-06")
         return 2
-
     if (end_dt.year, end_dt.month) < (start_dt.year, start_dt.month):
         print("End month must be >= start month")
         return 2
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-
     total_rows = 0
     months_done = 0
     for ym in iter_months_inclusive(YearMonth(start_dt.year, start_dt.month), YearMonth(end_dt.year, end_dt.month)):
-        rows, _ = fetch_and_ingest_month(ym, batch_rows=args.batch_rows, timeout=args.timeout)
+        rows, _ = process_zip_from_urls(
+            monthly_urls(ym), batch_rows=args.batch_rows, timeout=args.timeout
+        )
         total_rows += rows
         months_done += 1
 
     print(f"✅ Finished. Months: {months_done}, total rows upserted: {total_rows:,}")
     return 0
 
-
 if __name__ == "__main__":
-    sys.exit(main())
+    raise SystemExit(main())
