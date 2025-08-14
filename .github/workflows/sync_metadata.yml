@@ -1,10 +1,9 @@
-# .github/workflows/sync_metadata.yml
 name: Daily Company Metadata Sync
 
 on:
   schedule:
     - cron: "15 1 * * *"   # Daily at 01:15 UTC (02:15 during BST)
-  workflow_dispatch: {}     # <-- keeps the "Run workflow" button
+  workflow_dispatch: {}
 
 permissions:
   contents: write
@@ -12,25 +11,30 @@ permissions:
 jobs:
   sync-metadata:
     runs-on: ubuntu-latest
-    timeout-minutes: 180
+    timeout-minutes: 360
     concurrency:
       group: sync-metadata
       cancel-in-progress: false
 
-    # Available to all steps
     env:
-      # Companies House API key you already store as CH_API_KEY
-      COMPANIES_HOUSE_API_KEY: ${{ secrets.CH_API_KEY }}
+      # Required
+      CH_API_KEY: ${{ secrets.CH_API_KEY }}
 
-      # Pacing & chunking
-      TARGET_RPS: "2.0"
-      MAX_REQUESTS_PER_RUN: "9000"
-      REQUEST_TIMEOUT: "20"
-      BATCH_FLUSH: "200"
+      # Where your input CSVs live (space-separated folders)
+      # e.g. "financials_2022 financials_2023 daily_drops"
+      INPUT_DIRS: "financials"
 
-      # Make the ID discovery match your repo layout:
-      # - yearly_csvs_cleaned/*.csv (folder with year files)
-      # - *.csv (top-level year files, if any)
+      # Output artifacts
+      COMPANY_NUMBERS_CSV: "data/company_numbers.csv"
+      METADATA_DB: "data/company_metadata.sqlite"
+
+      # Fetcher controls (tune as desired)
+      CONCURRENCY: "8"
+      TIMEOUT: "20"
+      # Optionally refresh rows older than N days
+      REFRESH_SINCE_DAYS: "30"
+      # Set to "1" to refetch everything regardless of cache
+      FORCE_REFETCH: "0"
 
     steps:
       - name: Checkout repo
@@ -39,24 +43,21 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.10"
+          python-version: "3.11"
 
       - name: Install dependencies
-        run: pip install httpx pandas
+        run: |
+          python -m pip install --upgrade pip
+          pip install aiohttp
 
-      - name: Run metadata sync
+      - name: Run sync (orchestrates update + fetch)
         run: python sync_company_metadata.py
 
       - name: Commit and push updates
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
-          # Safely rebase even if this job created/modified files
           git pull --rebase --autostash || true
-
           git add -A
           git commit -m "Auto-update company metadata" || echo "No changes to commit"
-
-          # Use your repo secret named GH_TOKEN
-          git push https://x-access-token:${{ secrets.GH_TOKEN }}@github.com/${{ github.repository }} HEAD:main
+          git push https://x-access-token:${{ secrets.GH_TOKEN }}@github.com/${{ github.repository }} HEAD:${{ github.ref_name }}
