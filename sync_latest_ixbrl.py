@@ -46,7 +46,9 @@ def upsert_to_sqlite(df, sqlite_path, table="financials"):
         tgt_cols = [r[1] for r in cur.execute(f"PRAGMA table_info({table})")]
         stg_cols = [r[1] for r in cur.execute("PRAGMA table_info(_staging)")]
         if not tgt_cols:
-            cur.execute(f'CREATE TABLE IF NOT EXISTS "{table}" ({", ".join(f\'"{c}"\' for c in stg_cols)})')
+            # Build column list first to avoid nested f-string
+        columns_formatted = ", ".join(f'"{c}"' for c in stg_cols)
+        cur.execute(f'CREATE TABLE IF NOT EXISTS "{table}" ({columns_formatted})')
             tgt_cols = stg_cols
         for c in stg_cols:
             if c not in tgt_cols:
