@@ -6,25 +6,17 @@ Sync metadata for companies listed in yearly_sqlites/*.sqlite (table: financials
 What it does:
 1) Scans per-year SQLite files under --input-dir (default: yearly_sqlites), e.g., 2020.sqlite … 2025.sqlite
 2) Collects DISTINCT company numbers from the 'financials' table (prefers 'company_number', falls back to 'companies_house_registered_number')
-3) Writes a deduped list to data/company_numbers.csv
-4) Fetches Companies House /company/{number} profiles for those IDs
-5) Stores results in data/company_metadata.sqlite, one row per company
-6) Supports --max-per-run to limit how many NEW/stale companies to fetch this run
+3) Fetches Companies House /company/{number} profiles for those IDs
+4) Stores results in data/company_metadata.sqlite, one row per company
+5) Supports --max-per-run to limit how many NEW/stale companies to fetch this run
 
 Usage (local):
   export CH_API_KEY=YOUR_COMPANIES_HOUSE_API_KEY
   python sync_yearly_company_metadata.py --input-dir yearly_sqlites --max-per-run 50000
-
-You can re-run anytime; it resumes automatically and only fetches missing rows (or use --since-days / --force).
-
-Notes:
-- CH profile endpoint uses Basic auth with API key as username and empty password.
-- Script uses polite concurrency, retries, and respects Retry-After on 429.
 """
 
 import argparse
 import asyncio
-import csv
 import json
 import os
 import sqlite3
@@ -64,13 +56,13 @@ def init_db(db_path: Path) -> sqlite3.Connection:
     conn.commit()
     return conn
 
-# ---------- NEW: read company numbers from yearly_sqlites/*.sqlite ----------
+# ---------- read company numbers from yearly_sqlites/*.sqlite ----------
 
 def collect_company_numbers_from_sqlites(input_dir: Path, table: str = "financials") -> List[str]:
     """
     Open each *.sqlite under input_dir and SELECT DISTINCT company numbers.
     Prefers 'company_number'; falls back to 'companies_house_registered_number' if needed.
-    Normalizes: strip spaces, zfill to 8 digits.
+    Normalizes: strip spaces; if numeric, zero-fill to 8 digits.
     """
     if not input_dir.exists():
         print(f"WARNING: input dir not found: {input_dir}")
@@ -86,7 +78,6 @@ def collect_company_numbers_from_sqlites(input_dir: Path, table: str = "financia
         try:
             with sqlite3.connect(db) as con:
                 cur = con.cursor()
-                # Detect available ID column
                 cols = {r[1].lower(): r[1] for r in cur.execute(f'PRAGMA table_info("{table}")')}
                 id_col = None
                 for cand in ("company_number", "companies_house_registered_number"):
@@ -97,14 +88,13 @@ def collect_company_numbers_from_sqlites(input_dir: Path, table: str = "financia
                     print(f"MISS (no ID column) {db}::{table}")
                     continue
 
-                # Use DISTINCT to minimize memory
+                # DISTINCT to reduce memory pressure
                 for (raw,) in cur.execute(f'SELECT DISTINCT "{id_col}" FROM "{table}"'):
                     if raw is None:
                         continue
                     v = str(raw).strip().replace(" ", "")
                     if not v:
                         continue
-                    # normalize to 8-digit numeric-ish IDs if possible
                     if v.isdigit():
                         v = v.zfill(8)
                     numbers_set.add(v)
@@ -115,29 +105,7 @@ def collect_company_numbers_from_sqlites(input_dir: Path, table: str = "financia
     # deterministic order
     return sorted(numbers_set)
 
-# ---------------------------------------------------------------------------
-
-def write_company_numbers_csv(numbers: List[str], out_csv: Path) -> None:
-    out_csv.parent.mkdir(parents=True, exist_ok=True)
-    with out_csv.open("w", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
-        w.writerow(["company_number"])
-        for n in numbers:
-            w.writerow([n])
-    print(f"Wrote {len(numbers):,} unique IDs -> {out_csv}")
-
-def existing_company_numbers(conn: sqlite3.Connection) -> set:
-    cur = conn.execute("SELECT company_number FROM company_profiles")
-    return {r[0] for r in cur.fetchall()}
-
-def stale_company_numbers(conn: sqlite3.Connection, since_days: Optional[int]) -> set:
-    if not since_days:
-        return set()
-    cur = conn.execute(
-        "SELECT company_number FROM company_profiles WHERE fetched_at IS NOT NULL AND datetime(fetched_at) <= datetime('now', ?)",
-        (f"-{since_days} days",)
-    )
-    return {r[0] for r in cur.fetchall()}
+# ---------- CH fetch pipeline ----------
 
 async def fetch_profile(session: aiohttp.ClientSession, api_key: str, company_number: str, timeout: int) -> Dict[str, Any]:
     url = f"https://api.company-information.service.gov.uk/company/{company_number}"
@@ -200,7 +168,6 @@ async def worker(queue: asyncio.Queue, session: aiohttp.ClientSession, api_key: 
 async def fetch_many(api_key: str, numbers: List[str], db_path: Path, concurrency: int, timeout: int):
     conn = init_db(db_path)
     queue: asyncio.Queue = asyncio.Queue()
-
     for n in numbers:
         queue.put_nowait(n)
     for _ in range(concurrency):
@@ -215,11 +182,12 @@ async def fetch_many(api_key: str, numbers: List[str], db_path: Path, concurrenc
     conn.commit()
     conn.close()
 
+# ---------- CLI ----------
+
 def main():
-    parser = argparse.ArgumentParser(description="Sync Companies House metadata from yearly SQLites.")
+    parser = argparse.ArgumentParser(description="Sync Companies House metadata from yearly SQLites (no CSV).")
     parser.add_argument("--input-dir", default="yearly_sqlites", help="Folder containing per-year SQLite files (e.g., 2020.sqlite)")
     parser.add_argument("--table", default="financials", help="Table name in each yearly SQLite file")
-    parser.add_argument("--out-csv", default="data/company_numbers.csv", help="Output CSV of deduped company numbers")
     parser.add_argument("--db", default="data/company_metadata.sqlite", help="SQLite DB path for cached profiles")
     parser.add_argument("--max-per-run", type=int, default=None, help="Limit how many NEW/stale companies to fetch this run")
     parser.add_argument("--concurrency", type=int, default=DEFAULT_CONCURRENCY)
@@ -233,19 +201,25 @@ def main():
         raise SystemExit("CH_API_KEY env var is required")
 
     input_dir = Path(args.input_dir)
-    out_csv = Path(args.out_csv)
     db_path = Path(args.db)
 
-    # 1) Collect & write company_numbers.csv (from yearly_sqlites/*.sqlite)
+    # 1) Collect company numbers directly from yearly_sqlites/*.sqlite
     numbers = collect_company_numbers_from_sqlites(input_dir=input_dir, table=args.table)
     if not numbers:
         print("No company IDs found in yearly_sqlites.")
-    write_company_numbers_csv(numbers, out_csv)
+        return 0
 
     # 2) Decide which numbers to fetch
     conn = init_db(db_path)
-    existing = existing_company_numbers(conn)
-    stale = stale_company_numbers(conn, args.since_days) if args.since_days else set()
+    existing = {r[0] for r in conn.execute("SELECT company_number FROM company_profiles")}
+    if args.since_days:
+        stale = {r[0] for r in conn.execute(
+            "SELECT company_number FROM company_profiles "
+            "WHERE fetched_at IS NOT NULL AND datetime(fetched_at) <= datetime('now', ?)",
+            (f"-{args.since_days} days",)
+        )}
+    else:
+        stale = set()
 
     if args.force:
         to_fetch = numbers
@@ -263,6 +237,7 @@ def main():
         print("Fetch complete.")
     else:
         print("Nothing to fetch this run.")
+    return 0
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
