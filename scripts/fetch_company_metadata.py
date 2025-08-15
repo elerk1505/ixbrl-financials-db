@@ -57,15 +57,25 @@ CREATE_INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_company_profiles_fetched_at ON company_profiles(fetched_at)"
 ]
 
-def init_db(db_path: str) -> sqlite3.Connection:
-    conn = sqlite3.connect(db_path)
-    conn.execute("PRAGMA journal_mode=WAL;")
-    conn.execute("PRAGMA synchronous=NORMAL;")
-    conn.execute(CREATE_SQL)
-    for ddl in CREATE_INDEXES:
-        conn.execute(ddl)
-    conn.commit()
-    return conn
+def init_db(db_path: Path) -> sqlite3.Connection:
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        conn = sqlite3.connect(str(db_path))
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA synchronous=NORMAL;")
+        conn.execute(CREATE_SQL)
+        conn.commit()
+        return conn
+    except sqlite3.DatabaseError:
+        # Not a real SQLite file (likely an LFS pointer). Recreate it.
+        if os.path.exists(db_path):
+            os.remove(db_path)
+        conn = sqlite3.connect(str(db_path))
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA synchronous=NORMAL;")
+        conn.execute(CREATE_SQL)
+        conn.commit()
+        return conn
 
 def csv_company_numbers(csv_path: str, column: Optional[str] = None) -> List[str]:
     if not os.path.exists(csv_path):
