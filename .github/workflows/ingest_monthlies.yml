@@ -40,35 +40,31 @@ jobs:
         run: |
           python ingest_monthly_to_sqlite.py --start "${{ github.event.inputs.START }}" --end "${{ github.event.inputs.END }}"
 
-      # --- Git/LFS: make sure large SQLite files are tracked and we don't get non-fast-forward errors ---
-      - name: Git LFS install (runner)
+            - name: Git LFS install (runner)
         run: git lfs install --local
 
       - name: Ensure LFS tracking for SQLite
         run: |
           if [ ! -f .gitattributes ] || ! grep -q '\*\.sqlite filter=lfs diff=lfs merge=lfs -text' .gitattributes; then
             git lfs track "*.sqlite"
+            echo "Tracked *.sqlite via LFS"
           fi
-          git add .gitattributes
 
-      - name: Stage changes
+      - name: Pull latest to avoid non-fast-forward (pre-commit)
+        run: |
+          git fetch origin ${{ github.ref_name }}
+          git pull --rebase origin ${{ github.ref_name }} || true
+
+      - name: Stage + commit
         run: |
           git add -A
-
-      - name: Commit (if any)
-        run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git commit -m "Ingest monthly CH accounts (${{ github.event.inputs.START }}..${{ github.event.inputs.END }})" || echo "No changes"
 
-      - name: Pull latest to avoid non-fast-forward
-        run: |
-          # Rebase onto remote branch to avoid push rejection
-          git fetch origin ${{ github.ref_name }}
-          git rebase origin/${{ github.ref_name }} || true
-
-      - name: Push (LFS-aware)
+      - name: Final rebase, then push (LFS-aware)
         env:
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
         run: |
+          git pull --rebase origin ${{ github.ref_name }} || true
           git push https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }} HEAD:${{ github.ref_name }}
