@@ -30,17 +30,24 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: "pip"
 
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
           pip install pandas httpx stream-read-xbrl
 
+      # Pull before we start so we base work on latest main
+      - name: Pull latest to avoid non-fast-forward (pre-commit)
+        run: |
+          git fetch origin ${{ github.ref_name }}
+          git pull --rebase origin ${{ github.ref_name }} || true
+
       - name: Run monthly ingest
         run: |
           python ingest_monthly_to_sqlite.py --start "${{ github.event.inputs.START }}" --end "${{ github.event.inputs.END }}"
 
-            - name: Git LFS install (runner)
+      - name: Git LFS install (runner)
         run: git lfs install --local
 
       - name: Ensure LFS tracking for SQLite
@@ -49,11 +56,7 @@ jobs:
             git lfs track "*.sqlite"
             echo "Tracked *.sqlite via LFS"
           fi
-
-      - name: Pull latest to avoid non-fast-forward (pre-commit)
-        run: |
-          git fetch origin ${{ github.ref_name }}
-          git pull --rebase origin ${{ github.ref_name }} || true
+          git add .gitattributes
 
       - name: Stage + commit
         run: |
