@@ -11,18 +11,20 @@ permissions:
 jobs:
   sync-daily-ixbrl:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 120
 
     steps:
       - name: Checkout (with LFS)
         uses: actions/checkout@v4
         with:
           lfs: true
+          fetch-depth: 0   # needed for rebase
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: "pip"
 
       - name: Install dependencies
         run: |
@@ -33,13 +35,20 @@ jobs:
         run: |
           python sync_latest_ixbrl.py
 
-      - name: Git LFS install
-        run: git lfs install --local
+      - name: Ensure LFS is configured
+        run: |
+          git lfs install --local
+          # Ensure *.sqlite tracked via LFS (idempotent)
+          if [ ! -f .gitattributes ] || ! grep -q '\*\.sqlite filter=lfs diff=lfs merge=lfs -text' .gitattributes; then
+            git lfs track "*.sqlite"
+            git add .gitattributes
+            git commit -m "Track SQLite via LFS" || true
+          fi
 
       - name: Pull latest (avoid non-fast-forward)
         run: |
-          git fetch origin main
-          git pull origin main --rebase || true
+          git fetch origin ${{ github.ref_name }}
+          git pull origin ${{ github.ref_name }} --rebase || true
 
       - name: Commit & push updated SQLite files
         env:
@@ -47,8 +56,6 @@ jobs:
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
-          # Make sure LFS picks up .sqlite (should already be tracked in .gitattributes)
           git add -A
           git commit -m "Daily iXBRL sync → yearly_sqlites" || echo "No changes"
           git push https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }} HEAD:${{ github.ref_name }}
