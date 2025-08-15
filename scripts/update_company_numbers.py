@@ -1,98 +1,71 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-update_company_numbers.py
-
-Keeps company_numbers.csv up to date by scanning one or more folders
-containing financial CSVs you keep adding (streaming/bulk extracts, etc.).
-
-It looks for either column:
-  - "companies_house_registered_number" (preferred for your financials)
-  - "company_number"
-
-It de-duplicates and preserves order (new IDs appended to the bottom).
-
-Usage:
-  python update_company_numbers.py \
-      --inputs ./financials_2022 ./financials_2023 ./daily_drops \
-      --output company_numbers.csv
-
-Notes:
-- Only reads *.csv files by default (use --pattern to change).
-- For large folders, you can run this repeatedly; it's idempotent.
-"""
-import argparse
-import csv
+import argparse, os, sqlite3
 from pathlib import Path
+import pandas as pd
 
-def scan_ids_from_csv(path: Path, preferred_cols=("companies_house_registered_number","company_number")):
-    ids = []
-    try:
-        with path.open(newline="", encoding="utf-8") as f:
-            reader = csv.DictReader(f)
-            # resolve column
-            header_lc = {h.lower(): h for h in reader.fieldnames or []}
-            col = None
-            for cand in preferred_cols:
-                if cand in header_lc:
-                    col = header_lc[cand]
-                    break
-            if not col:
-                return ids
-            for row in reader:
-                v = (row.get(col) or "").strip().replace(" ", "")
-                if v:
-                    ids.append(v)
-    except Exception:
-        # skip bad files quietly
-        pass
-    return ids
+ID_CANDIDATES = [
+    "company_number",
+    "companies_house_registered_number",
+    "company_id",
+]
+
+def find_id_column(con, table):
+    cols = [r[1].lower() for r in con.execute(f"PRAGMA table_info('{table}')")]
+    for c in ID_CANDIDATES:
+        if c in cols:
+            return c
+    return None
+
+def pick_table_with_id(con):
+    tables = [r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'")]
+    for t in tables:
+        col = find_id_column(con, t)
+        if col:
+            return t, col
+    return None, None
+
+def collect_numbers(sqlite_dir: Path):
+    nums = []
+    for db in sorted(sqlite_dir.glob("*.sqlite")):
+        try:
+            with sqlite3.connect(db) as con:
+                table, id_col = pick_table_with_id(con)
+                if not table:
+                    print(f"SKIP: no ID column in {db.name}")
+                    continue
+                q = f'SELECT DISTINCT "{id_col}" FROM "{table}" WHERE "{id_col}" IS NOT NULL'
+                rows = [str(r[0]).replace(" ", "") for r in con.execute(q)]
+                before = len(nums)
+                nums.extend(rows)
+                print(f"OK   (+{len(nums)-before:>6} ids) {db.name}:{table}.{id_col}")
+        except sqlite3.DatabaseError as e:
+            print(f"SKIP: {db} not a database ({e})")
+    # dedupe preserving order
+    seen, out = set(), []
+    for n in nums:
+        if n and n not in seen:
+            out.append(n); seen.add(n)
+    return out
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--inputs", nargs="+", required=True, help="One or more folders to scan for CSVs")
-    ap.add_argument("--output", required=True, help="Output path for company_numbers.csv")
-    ap.add_argument("--pattern", default="*.csv", help="Glob pattern for files (default: *.csv)")
+    ap.add_argument("--inputs", default="yearly_sqlites", help="Folder containing per-year .sqlite files")
+    ap.add_argument("--output", default="data/company_numbers.csv")
     args = ap.parse_args()
 
-    folders = [Path(p) for p in args.inputs]
-    out = Path(args.output)
+    in_dir = Path(args.inputs)
+    out_csv = Path(args.output)
+    out_csv.parent.mkdir(parents=True, exist_ok=True)
 
-    # Load existing output (if present) to preserve prior order
-    existing = []
-    if out.exists():
-        with out.open(newline="", encoding="utf-8") as f:
-            r = csv.DictReader(f)
-            header_lc = {h.lower(): h for h in r.fieldnames or []}
-            col = header_lc.get("company_number") or header_lc.get("companies_house_registered_number")
-            if col:
-                for row in r:
-                    v = (row.get(col) or "").strip().replace(" ", "")
-                    if v:
-                        existing.append(v)
+    if not in_dir.exists():
+        print(f"WARNING: input dir not found: {in_dir}")
+        pd.DataFrame(columns=["company_number"]).to_csv(out_csv, index=False)
+        print(f"Wrote 0 unique company numbers to {out_csv}")
+        return
 
-    seen = set(existing)
-    merged = list(existing)
-
-    for folder in folders:
-        if not folder.exists():
-            continue
-        for path in folder.rglob(args.pattern):
-            ids = scan_ids_from_csv(path)
-            for cid in ids:
-                if cid not in seen:
-                    merged.append(cid)
-                    seen.add(cid)
-
-    # Write output (always with header "company_number")
-    out.parent.mkdir(parents=True, exist_ok=True)
-    with out.open("w", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
-        w.writerow(["company_number"])
-        for cid in merged:
-            w.writerow([cid])
-
-    print(f"Wrote {len(merged)} unique company numbers to {out}")
+    numbers = collect_numbers(in_dir)
+    pd.DataFrame({"company_number": numbers}).to_csv(out_csv, index=False)
+    print(f"Wrote {len(numbers)} unique company numbers to {out_csv}")
 
 if __name__ == "__main__":
     main()
