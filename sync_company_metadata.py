@@ -1,12 +1,6 @@
-import os
-import shlex
-import subprocess
-import sys
+#!/usr/bin/env python3
+import os, shlex, subprocess, sys
 from pathlib import Path
-
-def getenv(name: str, default: str | None = None) -> str | None:
-    val = os.getenv(name)
-    return val if val is not None else default
 
 def run(cmd: list[str]) -> None:
     print("+", " ".join(shlex.quote(c) for c in cmd), flush=True)
@@ -16,45 +10,36 @@ def main() -> int:
     repo = Path(__file__).resolve().parent
     scripts_dir = repo / "scripts"
 
-    # Resolve helper scripts
-    update_script = scripts_dir / "update_company_numbers.py"
-    fetch_script = scripts_dir / "fetch_company_metadata.py"
+    updater = scripts_dir / "update_company_numbers_sqlite.py"
+    fetcher = scripts_dir / "fetch_company_metadata.py"
 
-    if not update_script.exists():
-        print(f"ERROR: missing {update_script}. Make sure scripts/ is committed.", file=sys.stderr)
-        return 2
-    if not fetch_script.exists():
-        print(f"ERROR: missing {fetch_script}. Make sure scripts/ is committed.", file=sys.stderr)
-        return 2
+    if not updater.exists():
+        print(f"ERROR: missing {updater}", file=sys.stderr); return 2
+    if not fetcher.exists():
+        print(f"ERROR: missing {fetcher}", file=sys.stderr); return 2
 
-    # Inputs
-    input_dirs = getenv("INPUT_DIRS", "financials")
-    input_list = input_dirs.split()
+    input_dirs = os.getenv("INPUT_DIRS", "yearly_sqlites")
+    inputs = input_dirs.split()
 
-    # Outputs
-    company_numbers_csv = Path(getenv("COMPANY_NUMBERS_CSV", "data/company_numbers.csv"))
-    metadata_db = Path(getenv("METADATA_DB", "data/company_metadata.sqlite"))
-    company_numbers_csv.parent.mkdir(parents=True, exist_ok=True)
+    metadata_db = Path(os.getenv("METADATA_DB", "data/company_metadata.sqlite"))
     metadata_db.parent.mkdir(parents=True, exist_ok=True)
-    # Update company_numbers.csv (scan folders for company IDs)
-    run([sys.executable, str(update_script), "--inputs", *input_list, "--output", str(company_numbers_csv)])
 
-    # Fetch/refresh metadata
-    api_key = getenv("CH_API_KEY")
+    # 1) Upsert IDs into data/company_metadata.sqlite:company_numbers
+    run([sys.executable, str(updater), "--inputs", *inputs, "--db", str(metadata_db)])
+
+    # 2) Fetch metadata for NEW/stale companies
+    api_key = os.getenv("CH_API_KEY")
     if not api_key:
-        print("ERROR: CH_API_KEY is not set", file=sys.stderr)
-        return 3
+        print("ERROR: CH_API_KEY is not set", file=sys.stderr); return 3
 
-    # Controls
-    concurrency = getenv("CONCURRENCY", "8")
-    timeout = getenv("TIMEOUT", "20")
-    since_days = getenv("REFRESH_SINCE_DAYS")  # may be None
-    force = getenv("FORCE_REFETCH", "0") == "1"
+    concurrency = os.getenv("CONCURRENCY", "8")
+    timeout = os.getenv("TIMEOUT", "20")
+    since_days = os.getenv("REFRESH_SINCE_DAYS")
+    force = os.getenv("FORCE_REFETCH", "0") == "1"
 
     fetch_cmd = [
-        sys.executable, str(fetch_script),
+        sys.executable, str(fetcher),
         "--api-key", api_key,
-        "--csv", str(company_numbers_csv),
         "--db", str(metadata_db),
         "--concurrency", concurrency,
         "--timeout", timeout,
@@ -65,9 +50,8 @@ def main() -> int:
         fetch_cmd += ["--since-days", since_days.strip()]
 
     run(fetch_cmd)
-    print("Sync complete.")
+    print("✅ Metadata sync complete.")
     return 0
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
