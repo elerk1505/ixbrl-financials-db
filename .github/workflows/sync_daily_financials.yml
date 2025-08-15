@@ -1,0 +1,54 @@
+name: Daily iXBRL Financials Sync (daily ZIP → yearly_sqlites)
+
+on:
+  schedule:
+    - cron: "5 5 * * *"   # every day at 05:05 UTC
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  sync-daily-ixbrl:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout (with LFS)
+        uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas httpx stream-read-xbrl
+
+      - name: Run daily ingest
+        run: |
+          python sync_latest_ixbrl.py
+
+      - name: Git LFS install
+        run: git lfs install --local
+
+      - name: Pull latest (avoid non-fast-forward)
+        run: |
+          git fetch origin main
+          git pull origin main --rebase || true
+
+      - name: Commit & push updated SQLite files
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # Make sure LFS picks up .sqlite (should already be tracked in .gitattributes)
+          git add -A
+          git commit -m "Daily iXBRL sync → yearly_sqlites" || echo "No changes"
+          git push https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }} HEAD:${{ github.ref_name }}
