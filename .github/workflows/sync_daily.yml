@@ -5,8 +5,8 @@ name: Daily Company Metadata Sync
 
 on:
   schedule:
-    - cron: '0 5 * * *'
-  workflow_dispatch:
+    - cron: '0 5 * * *'   # 05:00 UTC daily
+  workflow_dispatch:       # allow manual run
 
 jobs:
   sync:
@@ -27,9 +27,31 @@ jobs:
           python -m pip install --upgrade pip
           pip install pandas aiohttp httpx
 
+      # --- Ensure data dir exists and the metadata DB is valid ---
+      - name: Prepare metadata DB path
+        run: |
+          mkdir -p data
+          # If the file exists but is not a real SQLite DB, remove it so the script can (re)create it.
+          if [ -f data/company_metadata.sqlite ]; then
+            python - << 'PY'
+import sqlite3, sys
+try:
+    con = sqlite3.connect("data/company_metadata.sqlite")
+    con.execute("PRAGMA user_version;")
+    con.close()
+    print("DB looks valid.")
+except Exception as e:
+    print("DB invalid, deleting:", e)
+    import os
+    os.remove("data/company_metadata.sqlite")
+PY
+          fi
+
       - name: Build company_numbers.csv from SQLite
         run: |
-          python scripts/update_company_numbers.py --inputs yearly_sqlites --output data/company_numbers.csv
+          python scripts/update_company_numbers.py \
+            --inputs yearly_sqlites \
+            --output data/company_numbers.csv
 
       - name: Fetch metadata into SQLite cache
         env:
@@ -41,7 +63,8 @@ jobs:
             --db data/company_metadata.sqlite \
             --concurrency 8 --timeout 20 --since-days 30
 
-      - name: Commit and push updated files
+      # --- Pull then push to avoid non-fast-forward errors ---
+      - name: Commit and push updated files (LFS-aware)
         env:
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
         run: |
@@ -49,4 +72,5 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add data/company_numbers.csv data/company_metadata.sqlite
           git commit -m "Auto-update company metadata" || echo "No changes to commit"
+          git pull --rebase https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }} main || true
           git push https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }} HEAD:${{ github.ref_name }}
