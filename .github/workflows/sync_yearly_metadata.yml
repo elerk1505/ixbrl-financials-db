@@ -32,7 +32,7 @@ jobs:
           lfs: true
           fetch-depth: 0
 
-      - name: Ensure LFS blobs present
+      - name: Ensure LFS blobs present (yearly_sqlites/*.sqlite)
         run: |
           git lfs install
           git lfs pull
@@ -41,31 +41,27 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: "pip"
 
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install pandas aiohttp httpx
+          pip install aiohttp
 
-      - name: Run bulk metadata sync from yearly_sqlites
+      - name: Run bulk metadata sync from yearly_sqlites (no CSV)
         env:
           MAX_PER_RUN: ${{ github.event.inputs.MAX_PER_RUN }}
           SINCE_DAYS: ${{ github.event.inputs.SINCE_DAYS }}
         run: |
           mkdir -p data
 
-          # build flag string from optional inputs
-          EXTRA_FLAGS=""
-          if [ -n "$MAX_PER_RUN" ]; then EXTRA_FLAGS="$EXTRA_FLAGS --max-per-run $MAX_PER_RUN"; fi
-          if [ -n "$SINCE_DAYS" ]; then EXTRA_FLAGS="$EXTRA_FLAGS --since-days $SINCE_DAYS"; fi
-
-          # If a stale non-SQLite file exists (e.g., LFS pointer), remove so script recreates it cleanly
+          # If an invalid SQLite file exists (e.g., LFS pointer), remove it so the script recreates it.
           if [ -f data/company_metadata.sqlite ]; then
             python - << 'PY'
 import sqlite3, os
 try:
     con = sqlite3.connect("data/company_metadata.sqlite")
-    con.execute("PRAGMA user_version;")
+    con.execute("PRAGMA user_version;").fetchall()
     con.close()
     print("metadata DB looks valid")
 except Exception as e:
@@ -74,25 +70,27 @@ except Exception as e:
 PY
           fi
 
-          # IMPORTANT: point at yearly_sqlites and pass --pattern "*.sqlite" and --db
+          EXTRA_FLAGS=""
+          [ -n "$MAX_PER_RUN" ] && EXTRA_FLAGS="$EXTRA_FLAGS --max-per-run $MAX_PER_RUN"
+          [ -n "$SINCE_DAYS" ] && EXTRA_FLAGS="$EXTRA_FLAGS --since-days $SINCE_DAYS"
+
           python sync_yearly_company_metadata.py \
             --input-dir yearly_sqlites \
-            --pattern "*.sqlite" \
-            --out-csv data/company_numbers.csv \
+            --table financials \
             --db data/company_metadata.sqlite \
             $EXTRA_FLAGS
 
-      - name: Pull latest (avoid non-fast-forward)
+      - name: Pull latest to avoid non-fast-forward
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git fetch origin ${{ github.ref_name }}
-          git pull origin ${{ github.ref_name }} --rebase || true
+          git pull --rebase origin ${{ github.ref_name }} || true
 
-      - name: Commit & push changes
+      - name: Commit & push updated metadata DB
         env:
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
         run: |
-          git add data/company_numbers.csv data/company_metadata.sqlite
-          git commit -m "Auto-update yearly metadata" || echo "No changes"
+          git add data/company_metadata.sqlite
+          git commit -m "Auto-update yearly company metadata (no CSV)" || echo "No changes"
           git push https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }} HEAD:${{ github.ref_name }}
