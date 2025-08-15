@@ -1,11 +1,11 @@
 permissions:
   contents: write
 
-name: Daily Company Metadata Sync
+name: Daily Company Metadata Sync (no CSV)
 
 on:
   schedule:
-    - cron: '0 5 * * *'   # 05:00 UTC daily
+    - cron: "0 5 * * *"   # 05:00 UTC daily
   workflow_dispatch: {}
 
 jobs:
@@ -18,7 +18,7 @@ jobs:
           lfs: true
           fetch-depth: 0
 
-      - name: Ensure LFS blobs present
+      - name: Ensure LFS blobs present (yearly_sqlites)
         run: |
           git lfs install
           git lfs pull
@@ -26,15 +26,15 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
-          cache: 'pip'
+          python-version: "3.11"
+          cache: "pip"
 
-      - name: Install dependencies
+      - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install pandas aiohttp httpx
+          pip install aiohttp
 
-      - name: Prepare metadata DB (recreate if invalid)
+      - name: Prepare metadata DB path
         run: |
           mkdir -p data
           if [ -f data/company_metadata.sqlite ]; then
@@ -42,43 +42,34 @@ jobs:
 import sqlite3, os
 try:
     con = sqlite3.connect("data/company_metadata.sqlite")
-    con.execute("PRAGMA user_version;")
+    con.execute("PRAGMA user_version;").fetchall()
     con.close()
-    print("DB looks valid.")
+    print("metadata DB looks valid")
 except Exception as e:
-    print("DB invalid, deleting:", e)
+    print("metadata DB invalid, deleting:", e)
     os.remove("data/company_metadata.sqlite")
 PY
           fi
 
-      - name: Upsert company_numbers into metadata DB (from yearly_sqlites)
-        run: |
-          python scripts/update_company_numbers_sqlite.py \
-            --inputs yearly_sqlites \
-            --db data/company_metadata.sqlite
-
-      - name: Fetch/refresh company profiles (no CSV)
+      - name: Run daily metadata sync (scan yearly_sqlites directly)
         env:
           CH_API_KEY: ${{ secrets.CH_API_KEY }}
         run: |
-          python scripts/fetch_company_metadata.py \
-            --api-key "$CH_API_KEY" \
+          python sync_yearly_company_metadata.py \
+            --input-dir yearly_sqlites \
+            --table financials \
             --db data/company_metadata.sqlite \
-            --concurrency 8 \
-            --timeout 20 \
-            --since-days 30
+            --since-days 30 \
+            --max-per-run 50000
 
-      - name: Pull latest (avoid non-fast-forward)
+      - name: Pull latest then push (LFS-aware)
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git fetch origin ${{ github.ref_name }}
-          git pull origin ${{ github.ref_name }} --rebase || true
-
-      - name: Commit & push updated metadata DB
-        env:
-          GH_TOKEN: ${{ secrets.GH_TOKEN }}
-        run: |
+          git pull --rebase origin ${{ github.ref_name }} || true
           git add data/company_metadata.sqlite
-          git commit -m "Daily metadata sync (DB-only)" || echo "No changes to commit"
+          git commit -m "Daily company metadata sync (no CSV)" || echo "No changes"
           git push https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }} HEAD:${{ github.ref_name }}
