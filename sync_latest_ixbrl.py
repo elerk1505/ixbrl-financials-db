@@ -11,21 +11,41 @@ import httpx
 from stream_read_xbrl import stream_read_xbrl_zip
 
 # -----------------------------------------------------------------------------
-# 1) Download + parse today's bulk ZIP into a DataFrame
+# 1) Download + parse today's (or recent) bulk ZIP into a DataFrame
 # -----------------------------------------------------------------------------
-today = datetime.now().strftime("%Y-%m-%d")
-zip_url = f"https://download.companieshouse.gov.uk/Accounts_Bulk_Data-{today}.zip"
-print("📦 Fetching:", zip_url)
+import time
 
-try:
-    with httpx.stream("GET", zip_url, timeout=60.0) as r:
+def try_fetch(days_back=0):
+    dt = datetime.utcnow()  # use UTC to match CH filenames
+    if days_back:
+        from datetime import timedelta
+        dt = dt - timedelta(days=days_back)
+    date_str = dt.strftime("%Y-%m-%d")
+    url = f"https://download.companieshouse.gov.uk/Accounts_Bulk_Data-{date_str}.zip"
+    headers = {"User-Agent": "ixbrl-financials-db/1.0 (+github actions)"}
+    print(f"📦 Trying {url}")
+    with httpx.stream("GET", url, timeout=120.0, headers=headers) as r:
         r.raise_for_status()
         with stream_read_xbrl_zip(r.iter_bytes()) as (columns, rows):
-            df = pd.DataFrame(rows, columns=columns)
-            # Use applymap for DataFrame-wide conversion
-            df = df.applymap(lambda x: str(x) if x is not None else "")
-except Exception as e:
-    print("❌ Failed to parse:", e)
+            df_local = pd.DataFrame(rows, columns=columns)
+            # robust string-normalisation
+            for col in df_local.columns:
+                df_local[col] = df_local[col].astype(str).where(df_local[col].notna(), "")
+            return df_local, date_str
+
+# try today, then yesterday, then -2 days
+last_err = None
+for back in (0, 1, 2):
+    try:
+        df, used_date = try_fetch(days_back=back)
+        print(f"✅ Using daily ZIP for {used_date}")
+        break
+    except Exception as e:
+        print(f"  ↪️ Failed for attempt {-back} day(s): {e}")
+        last_err = e
+        time.sleep(2)
+else:
+    print("❌ No daily ZIP available for the last 3 days:", last_err)
     raise SystemExit(1)
 
 # -----------------------------------------------------------------------------
