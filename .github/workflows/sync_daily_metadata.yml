@@ -2,17 +2,8 @@ name: Daily Company Metadata Sync (no CSV)
 
 on:
   schedule:
-    - cron: "0 5 * * *"      # 05:00 UTC daily
-  workflow_dispatch:
-    inputs:
-      MAX_PER_RUN:
-        description: "Max companies to fetch this run (blank = unlimited)"
-        required: false
-        default: "50000"
-      SINCE_DAYS:
-        description: "Refresh rows older than N days (blank = only missing)"
-        required: false
-        default: "30"
+    - cron: "0 5 * * *"   # 05:00 UTC daily
+  workflow_dispatch: {}
 
 permissions:
   contents: write
@@ -20,6 +11,9 @@ permissions:
 jobs:
   sync:
     runs-on: ubuntu-latest
+    env:
+      CH_API_KEY: ${{ secrets.CH_API_KEY }}
+
     steps:
       - name: Checkout (with LFS)
         uses: actions/checkout@v4
@@ -44,39 +38,33 @@ jobs:
           pip install aiohttp
 
       - name: Prepare metadata DB path
+        shell: bash
         run: |
           mkdir -p data
-          if [ -f data/company_metadata.sqlite ]; then
-            python - << 'PY'
+          python - <<'PY'
 import sqlite3, os
-try:
-    con = sqlite3.connect("data/company_metadata.sqlite")
-    con.execute("PRAGMA user_version;").fetchall()
-    con.close()
-    print("metadata DB looks valid")
-except Exception as e:
-    print("metadata DB invalid, deleting:", e)
-    os.remove("data/company_metadata.sqlite")
+p = "data/company_metadata.sqlite"
+if os.path.exists(p):
+    try:
+        con = sqlite3.connect(p)
+        con.execute("PRAGMA user_version;").fetchall()
+        con.close()
+        print("metadata DB looks valid")
+    except Exception as e:
+        print("metadata DB invalid, deleting:", e)
+        os.remove(p)
 PY
-          fi
 
       - name: Run daily metadata sync (scan yearly_sqlites directly)
-        env:
-          CH_API_KEY: ${{ secrets.CH_API_KEY }}
-          MAX_PER_RUN: ${{ github.event.inputs.MAX_PER_RUN }}
-          SINCE_DAYS: ${{ github.event.inputs.SINCE_DAYS }}
         run: |
-          EXTRA_FLAGS=""
-          [ -n "$MAX_PER_RUN" ] && EXTRA_FLAGS="$EXTRA_FLAGS --max-per-run $MAX_PER_RUN"
-          [ -n "$SINCE_DAYS" ] && EXTRA_FLAGS="$EXTRA_FLAGS --since-days $SINCE_DAYS"
-
           python sync_yearly_company_metadata.py \
             --input-dir yearly_sqlites \
             --table financials \
             --db data/company_metadata.sqlite \
-            $EXTRA_FLAGS
+            --since-days 30 \
+            --max-per-run 50000
 
-      - name: Pull then push (LFS-aware)
+      - name: Pull latest then push (LFS-aware)
         env:
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
         run: |
