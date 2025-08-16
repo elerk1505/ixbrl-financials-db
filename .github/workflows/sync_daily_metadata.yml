@@ -11,8 +11,6 @@ permissions:
 jobs:
   sync:
     runs-on: ubuntu-latest
-    env:
-      CH_API_KEY: ${{ secrets.CH_API_KEY }}
 
     steps:
       - name: Checkout (with LFS)
@@ -42,20 +40,22 @@ jobs:
         run: |
           mkdir -p data
           python - <<'PY'
-import sqlite3, os
-p = "data/company_metadata.sqlite"
-if os.path.exists(p):
-    try:
-        con = sqlite3.connect(p)
-        con.execute("PRAGMA user_version;").fetchall()
-        con.close()
-        print("metadata DB looks valid")
-    except Exception as e:
-        print("metadata DB invalid, deleting:", e)
-        os.remove(p)
-PY
+          import os, sqlite3
+          p = "data/company_metadata.sqlite"
+          if os.path.exists(p):
+              try:
+                  con = sqlite3.connect(p)
+                  con.execute("PRAGMA user_version;").fetchall()
+                  con.close()
+                  print("metadata DB looks valid")
+              except Exception as e:
+                  print("metadata DB invalid, deleting:", e)
+                  os.remove(p)
+          PY
 
       - name: Run daily metadata sync (scan yearly_sqlites directly)
+        env:
+          CH_API_KEY: ${{ secrets.CH_API_KEY }}
         run: |
           python sync_yearly_company_metadata.py \
             --input-dir yearly_sqlites \
