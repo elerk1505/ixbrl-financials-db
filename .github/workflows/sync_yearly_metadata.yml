@@ -21,8 +21,6 @@ jobs:
   sync:
     runs-on: ubuntu-latest
     timeout-minutes: 360
-    env:
-      CH_API_KEY: ${{ secrets.CH_API_KEY }}
 
     steps:
       - name: Checkout (with LFS)
@@ -49,25 +47,27 @@ jobs:
 
       - name: Run bulk metadata sync from yearly_sqlites (no CSV)
         env:
+          CH_API_KEY: ${{ secrets.CH_API_KEY }}
           MAX_PER_RUN: ${{ github.event.inputs.MAX_PER_RUN }}
           SINCE_DAYS: ${{ github.event.inputs.SINCE_DAYS }}
         shell: bash
         run: |
           mkdir -p data
-          # Ensure metadata DB is a real SQLite file (not an LFS pointer)
+
+          # If an invalid SQLite file exists (e.g., LFS pointer), remove so the script recreates it.
           python - <<'PY'
-import sqlite3, os
-p = "data/company_metadata.sqlite"
-if os.path.exists(p):
-    try:
-        con = sqlite3.connect(p)
-        con.execute("PRAGMA user_version;").fetchall()
-        con.close()
-        print("metadata DB looks valid")
-    except Exception as e:
-        print("metadata DB invalid, deleting:", e)
-        os.remove(p)
-PY
+          import os, sqlite3
+          p = "data/company_metadata.sqlite"
+          if os.path.exists(p):
+              try:
+                  con = sqlite3.connect(p)
+                  con.execute("PRAGMA user_version;").fetchall()
+                  con.close()
+                  print("metadata DB looks valid")
+              except Exception as e:
+                  print("metadata DB invalid, deleting:", e)
+                  os.remove(p)
+          PY
 
           EXTRA_FLAGS=""
           if [ -n "$MAX_PER_RUN" ]; then EXTRA_FLAGS="$EXTRA_FLAGS --max-per-run $MAX_PER_RUN"; fi
