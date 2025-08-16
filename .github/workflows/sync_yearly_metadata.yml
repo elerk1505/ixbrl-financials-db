@@ -1,6 +1,8 @@
 name: Sync Yearly Company Metadata
 
 on:
+  schedule:
+    - cron: "20 1 * * *"     # daily 01:20 UTC
   workflow_dispatch:
     inputs:
       MAX_PER_RUN:
@@ -11,8 +13,6 @@ on:
         description: "Refresh rows older than N days (blank = only missing)"
         required: false
         default: ""
-  schedule:
-    - cron: "20 1 * * *"   # daily 01:20 UTC
 
 permissions:
   contents: write
@@ -54,8 +54,6 @@ jobs:
           SINCE_DAYS: ${{ github.event.inputs.SINCE_DAYS }}
         run: |
           mkdir -p data
-
-          # If an invalid SQLite file exists (e.g., LFS pointer), remove it so the script recreates it.
           if [ -f data/company_metadata.sqlite ]; then
             python - << 'PY'
 import sqlite3, os
