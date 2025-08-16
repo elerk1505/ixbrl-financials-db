@@ -1,8 +1,6 @@
 name: Sync Yearly Company Metadata
 
 on:
-  schedule:
-    - cron: "20 1 * * *"     # daily 01:20 UTC
   workflow_dispatch:
     inputs:
       MAX_PER_RUN:
@@ -13,6 +11,8 @@ on:
         description: "Refresh rows older than N days (blank = only missing)"
         required: false
         default: ""
+  schedule:
+    - cron: "20 1 * * *"   # daily 01:20 UTC
 
 permissions:
   contents: write
@@ -21,7 +21,6 @@ jobs:
   sync:
     runs-on: ubuntu-latest
     timeout-minutes: 360
-
     env:
       CH_API_KEY: ${{ secrets.CH_API_KEY }}
 
@@ -52,25 +51,27 @@ jobs:
         env:
           MAX_PER_RUN: ${{ github.event.inputs.MAX_PER_RUN }}
           SINCE_DAYS: ${{ github.event.inputs.SINCE_DAYS }}
+        shell: bash
         run: |
           mkdir -p data
-          if [ -f data/company_metadata.sqlite ]; then
-            python - << 'PY'
+          # Ensure metadata DB is a real SQLite file (not an LFS pointer)
+          python - <<'PY'
 import sqlite3, os
-try:
-    con = sqlite3.connect("data/company_metadata.sqlite")
-    con.execute("PRAGMA user_version;").fetchall()
-    con.close()
-    print("metadata DB looks valid")
-except Exception as e:
-    print("metadata DB invalid, deleting:", e)
-    os.remove("data/company_metadata.sqlite")
+p = "data/company_metadata.sqlite"
+if os.path.exists(p):
+    try:
+        con = sqlite3.connect(p)
+        con.execute("PRAGMA user_version;").fetchall()
+        con.close()
+        print("metadata DB looks valid")
+    except Exception as e:
+        print("metadata DB invalid, deleting:", e)
+        os.remove(p)
 PY
-          fi
 
           EXTRA_FLAGS=""
-          [ -n "$MAX_PER_RUN" ] && EXTRA_FLAGS="$EXTRA_FLAGS --max-per-run $MAX_PER_RUN"
-          [ -n "$SINCE_DAYS" ] && EXTRA_FLAGS="$EXTRA_FLAGS --since-days $SINCE_DAYS"
+          if [ -n "$MAX_PER_RUN" ]; then EXTRA_FLAGS="$EXTRA_FLAGS --max-per-run $MAX_PER_RUN"; fi
+          if [ -n "$SINCE_DAYS" ]; then EXTRA_FLAGS="$EXTRA_FLAGS --since-days $SINCE_DAYS"; fi
 
           python sync_yearly_company_metadata.py \
             --input-dir yearly_sqlites \
