@@ -1,18 +1,18 @@
 name: Sync Yearly Company Metadata
 
 on:
+  schedule:
+    - cron: "20 1 * * *"      # daily 01:20 UTC
   workflow_dispatch:
     inputs:
       MAX_PER_RUN:
-        description: "Limit how many new/stale companies to fetch this run (blank = unlimited)"
+        description: Limit how many new/stale companies to fetch this run (blank = unlimited)
         required: false
         default: ""
       SINCE_DAYS:
-        description: "Refresh rows older than N days (blank = only missing)"
+        description: Refresh rows older than N days (blank = only missing)
         required: false
         default: ""
-  schedule:
-    - cron: "20 1 * * *"   # daily 01:20 UTC
 
 permissions:
   contents: write
@@ -45,16 +45,10 @@ jobs:
           python -m pip install --upgrade pip
           pip install aiohttp
 
-      - name: Run bulk metadata sync from yearly_sqlites (no CSV)
-        env:
-          CH_API_KEY: ${{ secrets.CH_API_KEY }}
-          MAX_PER_RUN: ${{ github.event.inputs.MAX_PER_RUN }}
-          SINCE_DAYS: ${{ github.event.inputs.SINCE_DAYS }}
+      - name: Ensure metadata DB is valid (remove if invalid)
         shell: bash
         run: |
           mkdir -p data
-
-          # If an invalid SQLite file exists (e.g., LFS pointer), remove so the script recreates it.
           python - <<'PY'
           import os, sqlite3
           p = "data/company_metadata.sqlite"
@@ -67,11 +61,19 @@ jobs:
               except Exception as e:
                   print("metadata DB invalid, deleting:", e)
                   os.remove(p)
+          else:
+              print("no metadata DB yet")
           PY
 
+      - name: Run bulk metadata sync from yearly_sqlites (no CSV)
+        env:
+          CH_API_KEY: ${{ secrets.CH_API_KEY }}
+          MAX_PER_RUN: ${{ github.event.inputs.MAX_PER_RUN }}
+          SINCE_DAYS: ${{ github.event.inputs.SINCE_DAYS }}
+        run: |
           EXTRA_FLAGS=""
-          if [ -n "$MAX_PER_RUN" ]; then EXTRA_FLAGS="$EXTRA_FLAGS --max-per-run $MAX_PER_RUN"; fi
-          if [ -n "$SINCE_DAYS" ]; then EXTRA_FLAGS="$EXTRA_FLAGS --since-days $SINCE_DAYS"; fi
+          [ -n "$MAX_PER_RUN" ] && EXTRA_FLAGS="$EXTRA_FLAGS --max-per-run $MAX_PER_RUN"
+          [ -n "$SINCE_DAYS" ]  && EXTRA_FLAGS="$EXTRA_FLAGS --since-days $SINCE_DAYS"
 
           python sync_yearly_company_metadata.py \
             --input-dir yearly_sqlites \
