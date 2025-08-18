@@ -18,7 +18,6 @@ jobs:
       AZURE_SQL_DATABASE: ${{ secrets.AZURE_SQL_DATABASE }}
       AZURE_SQL_USERNAME: ${{ secrets.AZURE_SQL_USERNAME }}
       AZURE_SQL_PASSWORD: ${{ secrets.AZURE_SQL_PASSWORD }}
-      AZURE_SQL_CONN:     ${{ secrets.AZURE_SQL_CONN }}
       CONCURRENCY: "8"
       TIMEOUT: "20"
       SINCE_DAYS: "30"
