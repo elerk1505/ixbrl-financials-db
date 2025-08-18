@@ -23,7 +23,7 @@ jobs:
       AZURE_SQL_DATABASE: ${{ secrets.AZURE_SQL_DATABASE }}      # e.g. ixbrl_financials
       AZURE_SQL_USERNAME: ${{ secrets.AZURE_SQL_USERNAME }}      # often user@ixbrl-sql-server
       AZURE_SQL_PASSWORD: ${{ secrets.AZURE_SQL_PASSWORD }}
-
+      AZURE_SQL_ODBC:     ${{ secrets.AZURE_SQL_ODBC }}
       # Azure CLI (for firewall open/close)
       AZ_SUBSCRIPTION:    ${{ secrets.AZURE_SUBSCRIPTION_ID }}
       AZ_RG:              ${{ secrets.AZURE_RESOURCE_GROUP }}     # ixbrl-financials-rg
