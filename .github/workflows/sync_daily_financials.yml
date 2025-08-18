@@ -18,10 +18,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 120
     env:
-      # Python code expects these names exactly:
+      # Python code expects these FOUR names exactly:
       AZURE_SQL_SERVER:   ${{ secrets.AZURE_SQL_SERVER }}        # e.g. ixbrl-sql-server.database.windows.net
       AZURE_SQL_DATABASE: ${{ secrets.AZURE_SQL_DATABASE }}      # e.g. ixbrl_financials
-      AZURE_SQL_USERNAME: ${{ secrets.AZURE_SQL_USERNAME }}      # e.g. sql_admin or user@ixbrl-sql-server
+      AZURE_SQL_USERNAME: ${{ secrets.AZURE_SQL_USERNAME }}      # often user@ixbrl-sql-server
       AZURE_SQL_PASSWORD: ${{ secrets.AZURE_SQL_PASSWORD }}
 
       # Azure CLI (for firewall open/close)
@@ -76,7 +76,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install httpx pandas stream-read-xbrl sqlalchemy pyodbc
 
-      # (optional) quick connectivity test
+      # Optional connectivity check
       - name: Connectivity check
         shell: bash
         run: |
@@ -92,11 +92,10 @@ jobs:
               cur=c.cursor(); cur.execute("SELECT 1"); print("SELECT 1 ->", cur.fetchone()[0])
           PY
 
-      - name: Run daily ingest (checks last 5 days; skips 404s)
-        run: |
-          python sync_latest_ixbrl.py --lookback-days 5
+      - name: Run daily ingest (5-day rolling lookback)
+        run: python sync_latest_ixbrl.py --lookback-days 5
 
-      # Always close the firewall rule (no --yes flag)
+      # Always close the firewall rule
       - name: Remove runner IP from firewall
         if: always()
         shell: bash
