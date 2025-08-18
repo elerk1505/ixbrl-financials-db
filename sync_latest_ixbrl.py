@@ -236,7 +236,7 @@ def main() -> int:
             print(f"Unexpected SQL error for {date_str}: {e}")
             return 1
 
-        print(f"✅ {date_str}: appended {rows} rows into {args.schema}.{args.staging_table}.")
+        print(f"✅ {date_str}: appended {rows} rows into dbo.financials (via staging {args.staging_table}).")
         any_success = True
 
     if not any_success:
