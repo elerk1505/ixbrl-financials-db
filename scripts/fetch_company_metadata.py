@@ -1,335 +1,144 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-Fetch Companies House company profiles and cache them in SQLite.
-
-Modes
------
-1) CSV-FREE (recommended):
-   - Omit --csv. The script will read company numbers from the
-     `company_numbers` table inside --db (data/company_metadata.sqlite).
-
-2) Legacy CSV mode (optional):
-   - Provide --csv with a CSV containing a "company_number" (or
-     "companies_house_registered_number") column.
-
-Behavior
---------
-- Resume-safe caching in table `company_profiles`.
-- Only fetches missing rows by default.
-- Use --since-days N to refresh stale rows (rows with fetched_at <= now- N days).
-- Use --force to refetch all.
-- Handles 429 with Retry-After, plus transient errors, concurrent requests.
-
-Schema
-------
-company_profiles (
-    company_number TEXT PRIMARY KEY,
-    fetched_at     TEXT,
-    http_status    INTEGER,
-    etag           TEXT,
-    payload_json   TEXT,
-    error          TEXT
-)
-
-Optionally (maintained by your other script):
-company_numbers (
-    company_number TEXT PRIMARY KEY
-)
-"""
-from __future__ import annotations
-
-import argparse
-import asyncio
-import aiohttp
-import csv
-import json
-import os
-import sqlite3
-from pathlib import Path
+import os, json, asyncio, aiohttp
 from datetime import datetime, timezone
-from typing import Optional, Dict, Any, Iterable, List
+from typing import List, Dict, Any, Optional
+from sqlalchemy import text
+from scripts.azure_sql import engine, ensure_company_profiles_table, distinct_company_numbers_from_financials
 
-DEFAULT_TIMEOUT = 20
-DEFAULT_CONCURRENCY = 8
+DEFAULT_CONCURRENCY = int(os.getenv("CONCURRENCY","8"))
+DEFAULT_TIMEOUT     = int(os.getenv("TIMEOUT","20"))
 
-CREATE_SQL = """
-CREATE TABLE IF NOT EXISTS company_profiles (
-    company_number TEXT PRIMARY KEY,
-    fetched_at TEXT,
-    http_status INTEGER,
-    etag TEXT,
-    payload_json TEXT,
-    error TEXT
-);
-"""
-CREATE_INDEXES = [
-    "CREATE INDEX IF NOT EXISTS idx_company_profiles_status ON company_profiles(http_status)",
-    "CREATE INDEX IF NOT EXISTS idx_company_profiles_fetched_at ON company_profiles(fetched_at)"
-]
-
-# ------------------------
-# DB helpers
-# ------------------------
-
-def init_db(db_path: Path) -> sqlite3.Connection:
-    db_path.parent.mkdir(parents=True, exist_ok=True)
-    def _open_ok() -> sqlite3.Connection:
-        conn = sqlite3.connect(str(db_path))
-        # fast fail if not a real DB
-        conn.execute("PRAGMA journal_mode=WAL;")
-        conn.execute("PRAGMA synchronous=NORMAL;")
-        return conn
-    try:
-        conn = _open_ok()
-    except sqlite3.DatabaseError:
-        # Not a real SQLite (e.g., LFS pointer) → recreate
-        try:
-            os.remove(db_path)
-        except FileNotFoundError:
-            pass
-        conn = _open_ok()
-
-    conn.execute(CREATE_SQL)
-    for ddl in CREATE_INDEXES:
-        conn.execute(ddl)
-    conn.commit()
-    return conn
-
-def table_exists(conn: sqlite3.Connection, name: str) -> bool:
-    cur = conn.execute(
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name = ? LIMIT 1",
-        (name,)
-    )
-    return cur.fetchone() is not None
-
-# ------------------------
-# Load target company IDs
-# ------------------------
-
-def csv_company_numbers(csv_path: str, column: Optional[str] = None) -> List[str]:
-    if not os.path.exists(csv_path):
-        raise FileNotFoundError(f"CSV not found: {csv_path}")
-    candidates = ["company_number", "companies_house_registered_number"]
-    if column:
-        candidates = [column] + [c for c in candidates if c != column]
-
-    numbers: List[str] = []
-    with open(csv_path, newline="", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        # Resolve column name (case-insensitive)
-        header_lc = {h.lower(): h for h in (reader.fieldnames or [])}
-        col = None
-        for cand in candidates:
-            if cand in header_lc:
-                col = header_lc[cand]
-                break
-        if not col:
-            raise ValueError(f"CSV must include one of columns {candidates}; found: {reader.fieldnames}")
-
-        for row in reader:
-            val = (row.get(col) or "").strip().replace(" ", "")
-            if val:
-                numbers.append(val)
-
-    # De-dup preserving order
-    seen, uniq = set(), []
-    for n in numbers:
-        if n not in seen:
-            uniq.append(n); seen.add(n)
-    return uniq
-
-def db_company_numbers_for_fetch(conn: sqlite3.Connection) -> List[str]:
-    """
-    Read company IDs from company_numbers table (if present).
-    Returns a de-duplicated list of strings.
-    """
-    if not table_exists(conn, "company_numbers"):
-        return []
-    try:
-        rows = conn.execute("SELECT company_number FROM company_numbers").fetchall()
-    except sqlite3.DatabaseError:
-        return []
-    out: List[str] = []
-    seen = set()
-    for (num,) in rows:
-        n = ("" if num is None else str(num)).replace(" ", "")
-        if n and n not in seen:
-            out.append(n); seen.add(n)
-    return out
-
-# ------------------------
-# Selection logic
-# ------------------------
-
-def existing_company_numbers(conn: sqlite3.Connection) -> set:
-    cur = conn.execute("SELECT company_number FROM company_profiles")
-    return {r[0] for r in cur.fetchall()}
-
-def needs_refresh(conn: sqlite3.Connection, since_days: Optional[int]) -> set:
-    if since_days is None:
-        return set()
-    cur = conn.execute(
-        "SELECT company_number FROM company_profiles "
-        "WHERE fetched_at IS NOT NULL AND datetime(fetched_at) <= datetime('now', ?)",
-        (f"-{since_days} days",)
-    )
-    return {r[0] for r in cur.fetchall()}
-
-# ------------------------
-# HTTP fetch
-# ------------------------
-
-async def fetch_profile(session: aiohttp.ClientSession, api_key: str, company_number: str, timeout: int) -> Dict[str, Any]:
-    url = f"https://api.company-information.service.gov.uk/company/{company_number}"
+async def fetch_one(session, api_key:str, company_number:str, timeout:int) -> Dict[str,Any]:
+    url=f"https://api.company-information.service.gov.uk/company/{company_number}"
     for attempt in range(8):
         try:
-            async with session.get(url, timeout=timeout, auth=aiohttp.BasicAuth(api_key, "")) as resp:
-                status = resp.status
-                etag = resp.headers.get("ETag")
-                text = await resp.text()
-                try:
-                    data = json.loads(text)
-                except json.JSONDecodeError:
-                    data = {"raw": text}
-
-                if status == 200:
-                    return {"status": status, "etag": etag, "json": data, "error": None}
-                elif status in (404, 410):
-                    return {"status": status, "etag": etag, "json": data, "error": f"Not found ({status})"}
-                elif status == 429:
-                    retry_after = resp.headers.get("Retry-After")
-                    delay = float(retry_after) if (retry_after and retry_after.isdigit()) else (2 ** attempt)
-                    await asyncio.sleep(delay)
-                    continue
-                elif 500 <= status < 600:
-                    await asyncio.sleep(2 ** attempt)
-                    continue
-                else:
-                    return {"status": status, "etag": etag, "json": data, "error": f"HTTP {status}"}
+            async with session.get(url, timeout=timeout, auth=aiohttp.BasicAuth(api_key,"")) as r:
+                txt=await r.text()
+                try: data=json.loads(txt)
+                except json.JSONDecodeError: data={"raw":txt}
+                if r.status==200:
+                    return dict(status=200, json=data, etag=r.headers.get("ETag"), error=None)
+                if r.status in (404,410):
+                    return dict(status=r.status, json=data, etag=r.headers.get("ETag"), error=f"Not found {r.status}")
+                if r.status==429:
+                    ra=r.headers.get("Retry-After")
+                    delay=float(ra) if ra and ra.isdigit() else (2**attempt)
+                    await asyncio.sleep(delay); continue
+                if 500<=r.status<600:
+                    await asyncio.sleep(2**attempt); continue
+                return dict(status=r.status, json=data, etag=r.headers.get("ETag"), error=f"HTTP {r.status}")
         except (aiohttp.ClientError, asyncio.TimeoutError):
-            await asyncio.sleep(min(60, 1.5 ** attempt))
-    return {"status": None, "etag": None, "json": None, "error": f"Request failed after retries for {company_number}"}
+            await asyncio.sleep(min(60,1.5**attempt))
+    return dict(status=None, json=None, etag=None, error="Retries exhausted")
 
-def upsert_profile(conn: sqlite3.Connection, company_number: str, result: Dict[str, Any]) -> None:
-    fetched_at = datetime.now(timezone.utc).isoformat()
-    payload_json = json.dumps(result.get("json"))
-    conn.execute(
-        """
-        INSERT INTO company_profiles(company_number, fetched_at, http_status, etag, payload_json, error)
-        VALUES(?,?,?,?,?,?)
-        ON CONFLICT(company_number) DO UPDATE SET
-            fetched_at=excluded.fetched_at,
-            http_status=excluded.http_status,
-            etag=excluded.etag,
-            payload_json=excluded.payload_json,
-            error=excluded.error
-        """,
-        (company_number, fetched_at, result.get("status"), result.get("etag"), payload_json, result.get("error")),
-    )
-
-# ------------------------
-# Workers
-# ------------------------
-
-async def worker(name: int, queue: asyncio.Queue, session: aiohttp.ClientSession,
-                 api_key: str, timeout: int, conn: sqlite3.Connection, db_lock: asyncio.Lock):
-    while True:
-        item = await queue.get()
-        if item is None:
-            queue.task_done()
-            return
-        company_number = item
-        res = await fetch_profile(session, api_key, company_number, timeout)
-        # serialize DB writes to avoid interleaving on the same connection
-        async with db_lock:
-            upsert_profile(conn, company_number, res)
-        queue.task_done()
-
-# ------------------------
-# Pipeline
-# ------------------------
-
-async def run_pipeline(api_key: str,
-                      db_path: str,
-                      csv_path: Optional[str],
-                      column: Optional[str],
-                      concurrency: int,
-                      timeout: int,
-                      force: bool,
-                      since_days: Optional[int]):
-    conn = init_db(Path(db_path))
-
-    # Decide target set (CSV -> list OR DB->company_numbers)
-    if csv_path:
-        target_numbers = csv_company_numbers(csv_path, column=column)
-        source_label = f"CSV:{csv_path}"
-    else:
-        target_numbers = db_company_numbers_for_fetch(conn)
-        source_label = "DB:company_numbers"
-
-    existing = existing_company_numbers(conn)
-    stale = needs_refresh(conn, since_days) if since_days else set()
-
+def select_targets(since_days: Optional[int], force: bool, max_per_run: Optional[int]) -> List[str]:
+    ensure_company_profiles_table()
+    all_ids = distinct_company_numbers_from_financials()
+    with engine().begin() as con:
+        existing = {r[0] for r in con.execute(text("SELECT company_number FROM dbo.company_profiles"))}
+        stale=set()
+        if since_days:
+            q=text("SELECT company_number FROM dbo.company_profiles WHERE fetched_at<=DATEADD(day,-:d, SYSUTCDATETIME())")
+            stale={r[0] for r in con.execute(q, {"d":int(since_days)})}
     if force:
-        to_fetch = target_numbers
+        targets=all_ids
     else:
-        to_fetch = [n for n in target_numbers if (n not in existing) or (n in stale)]
+        targets=[n for n in all_ids if (n not in existing) or (n in stale)]
+    if max_per_run:
+        targets=targets[:int(max_per_run)]
+    print(f"IDs total:{len(all_ids):,} existing:{len(existing):,} stale:{len(stale):,} to_fetch:{len(targets):,}")
+    return targets
 
-    print(f"Source {source_label} → {len(target_numbers):,} IDs | "
-          f"already cached: {len(existing):,} | stale: {len(stale):,} | fetching now: {len(to_fetch):,}")
+def upsert_many(rows: List[Dict[str,Any]]):
+    if not rows: return
+    rows = [
+        dict(
+            company_number=r["company_number"],
+            fetched_at=datetime.now(timezone.utc).isoformat(),
+            http_status=r["status"], etag=r["etag"],
+            payload_json=json.dumps(r["json"]),
+            error=r["error"]
+        )
+        for r in rows
+    ]
+    with engine().begin() as con:
+        ensure_company_profiles_table()
+        # Use table-valued insert via JSON shredding
+        con.execute(text("""
+        DECLARE @j NVARCHAR(MAX) = :payload;
+        WITH x AS (
+          SELECT
+            j.value('(company_number)[1]','nvarchar(64)') AS company_number,
+            j.value('(fetched_at)[1]','nvarchar(64)')     AS fetched_at,
+            j.value('(http_status)[1]','int')             AS http_status,
+            j.value('(etag)[1]','nvarchar(256)')          AS etag,
+            j.value('(payload_json)[1]','nvarchar(max)')  AS payload_json,
+            j.value('(error)[1]','nvarchar(4000)')        AS error
+          FROM OPENJSON(@j) WITH (obj nvarchar(max) AS JSON)
+          CROSS APPLY OPENJSON(obj) WITH (
+              company_number nvarchar(64) '$.company_number',
+              fetched_at nvarchar(64) '$.fetched_at',
+              http_status int '$.http_status',
+              etag nvarchar(256) '$.etag',
+              payload_json nvarchar(max) '$.payload_json',
+              error nvarchar(4000) '$.error'
+          ) j
+        )
+        MERGE dbo.company_profiles AS t
+        USING x AS s
+          ON t.company_number=s.company_number
+        WHEN MATCHED THEN UPDATE SET
+          fetched_at = s.fetched_at,
+          http_status = s.http_status,
+          etag = s.etag,
+          payload_json = s.payload_json,
+          error = s.error
+        WHEN NOT MATCHED THEN
+          INSERT(company_number,fetched_at,http_status,etag,payload_json,error)
+          VALUES(s.company_number,s.fetched_at,s.http_status,s.etag,s.payload_json,s.error);
+        """), {"payload": json.dumps(rows)})
 
-    if not to_fetch:
-        conn.commit()
-        conn.close()
-        print("Nothing to fetch.")
-        return
+async def run(api_key:str, since_days: Optional[int], force: bool, max_per_run: Optional[int],
+              concurrency:int, timeout:int):
+    targets = select_targets(since_days, force, max_per_run)
+    if not targets:
+        print("Nothing to fetch."); return
 
-    queue: asyncio.Queue = asyncio.Queue()
-    for n in to_fetch:
-        queue.put_nowait(n)
-    for _ in range(concurrency):
-        queue.put_nowait(None)
+    queue = asyncio.Queue()
+    for t in targets: queue.put_nowait(t)
+    for _ in range(concurrency): queue.put_nowait(None)
 
     timeout_obj = aiohttp.ClientTimeout(total=None, sock_connect=timeout, sock_read=timeout)
-    db_lock = asyncio.Lock()
+    results = []
+
     async with aiohttp.ClientSession(timeout=timeout_obj) as session:
-        workers = [asyncio.create_task(worker(i, queue, session, api_key, timeout, conn, db_lock))
-                   for i in range(concurrency)]
+        async def worker():
+            while True:
+                c = await queue.get()
+                if c is None: queue.task_done(); return
+                res = await fetch_one(session, api_key, c, timeout)
+                res["company_number"]=c
+                results.append(res)
+                if len(results)>=500:
+                    upsert_many(results); results.clear()
+                queue.task_done()
+
+        tasks=[asyncio.create_task(worker()) for _ in range(concurrency)]
         await queue.join()
-        for w in workers:
-            await w
+        for t in tasks: await t
 
-    conn.commit()
-    conn.close()
-    print("Done.")
-
-# ------------------------
-# CLI
-# ------------------------
+    if results:
+        upsert_many(results)
 
 def main():
-    p = argparse.ArgumentParser(description="Fetch Companies House company profiles into SQLite.")
-    p.add_argument("--api-key", required=True, help="Companies House API key")
-    p.add_argument("--db", default="company_metadata.sqlite", help="SQLite DB path (created if missing)")
-    p.add_argument("--csv", default=None, help="(Optional) CSV with company numbers")
-    p.add_argument("--column", default=None, help="Column in CSV; default tries common names")
-    p.add_argument("--concurrency", type=int, default=DEFAULT_CONCURRENCY, help="Concurrent requests")
-    p.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT, help="Per-request socket timeout (seconds)")
-    p.add_argument("--force", action="store_true", help="Force refetch of all target company numbers")
-    p.add_argument("--since-days", type=int, default=None, help="Refetch rows older than N days")
-    args = p.parse_args()
+    api_key = os.getenv("CH_API_KEY")
+    if not api_key:
+        raise SystemExit("CH_API_KEY env var is required")
+    since_days = int(os.getenv("SINCE_DAYS","0") or 0) or None
+    max_per_run = int(os.getenv("MAX_PER_RUN","0") or 0) or None
+    force = os.getenv("FORCE_REFETCH","0")=="1"
 
-    asyncio.run(run_pipeline(
-        api_key=args.api_key,
-        db_path=args.db,
-        csv_path=args.csv,
-        column=args.column,
-        concurrency=args.concurrency,
-        timeout=args.timeout,
-        force=args.force,
-        since_days=args.since_days,
-    ))
+    asyncio.run(run(api_key, since_days, force, max_per_run, DEFAULT_CONCURRENCY, DEFAULT_TIMEOUT))
 
-if __name__ == "__main__":
+if __name__=="__main__":
     main()
