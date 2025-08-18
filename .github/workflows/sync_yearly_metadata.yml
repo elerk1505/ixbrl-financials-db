@@ -17,6 +17,7 @@ on:
         default: "0"
 
 permissions:
+  id-token: write     # needed for OIDC
   contents: read
 
 jobs:
@@ -25,16 +26,24 @@ jobs:
     timeout-minutes: 720
     env:
       CH_API_KEY:         ${{ secrets.CH_API_KEY }}
-      AZURE_SQL_SERVER:   ${{ secrets.AZURE_SQL_SERVER }}        # e.g. myserver.database.windows.net
+
+      # Azure SQL creds (SQL authentication)
+      AZURE_SQL_SERVER:   ${{ secrets.AZURE_SQL_SERVER }}        # e.g. ixbrl-sql-server.database.windows.net
       AZURE_SQL_DATABASE: ${{ secrets.AZURE_SQL_DATABASE }}
-      AZURE_SQL_USERNAME: ${{ secrets.AZURE_SQL_USERNAME }}      # consider user@myserver
+      AZURE_SQL_USERNAME: ${{ secrets.AZURE_SQL_USERNAME }}
       AZURE_SQL_PASSWORD: ${{ secrets.AZURE_SQL_PASSWORD }}
-      # AZURE_SQL_CONN:   ${{ secrets.AZURE_SQL_CONN }}          # ← keep removed
+
+      # knobs for fetch_company_metadata
       CONCURRENCY: "8"
       TIMEOUT: "20"
       MAX_PER_RUN:  ${{ github.event.inputs.MAX_PER_RUN }}
       SINCE_DAYS:   ${{ github.event.inputs.SINCE_DAYS }}
       FORCE_REFETCH:  ${{ github.event.inputs.FORCE_REFETCH }}
+
+      # for firewall open/close
+      AZ_SUBSCRIPTION: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      AZ_RG:           ${{ secrets.AZURE_RESOURCE_GROUP }}
+      AZ_SQL_NAME:     ${{ secrets.AZURE_SQL_SERVER_NAME }}   # short server name, e.g. ixbrl-sql-server
 
     steps:
       - uses: actions/checkout@v4
@@ -44,18 +53,16 @@ jobs:
           python-version: "3.11"
           cache: "pip"
 
-      # Login to Azure
-      - name: Azure login
+      # OIDC login
+      - name: Azure Login (OIDC)
         uses: azure/login@v2
         with:
-          creds: ${{ secrets.AZURE_CREDENTIALS }}
+          client-id:       ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id:       ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
-      # Create temporary firewall rule for this runner IP
+      # Add temp firewall rule
       - name: Allow runner IP in Azure SQL firewall
-        env:
-          AZ_SUBSCRIPTION: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
-          AZ_RG:           ${{ secrets.AZURE_RESOURCE_GROUP }}
-          AZ_SQL_NAME:     ${{ secrets.AZURE_SQL_SERVER_NAME }}   # e.g. myserver
         run: |
           set -e
           az account set --subscription "$AZ_SUBSCRIPTION"
@@ -77,48 +84,32 @@ jobs:
           sudo apt-get update
           sudo ACCEPT_EULA=Y apt-get install -y msodbcsql18 unixodbc-dev
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install -r requirements.txt || pip install aiohttp pandas sqlalchemy pyodbc httpx stream-read-xbrl
           python -c "import pyodbc; print('Available ODBC drivers:', pyodbc.drivers())"
 
-      # (Optional) sanity check connectivity before running your script
       - name: Connectivity check
-        shell: bash
         run: |
-          cat > check_conn.py <<'PY'
+          python - <<'PY'
           import os, pyodbc
-          server   = os.getenv("AZURE_SQL_SERVER")
-          database = os.getenv("AZURE_SQL_DATABASE")
-          username = os.getenv("AZURE_SQL_USERNAME")
-          password = os.getenv("AZURE_SQL_PASSWORD")
-          conn_str = (
-              "Driver=ODBC Driver 18 for SQL Server;"
-              f"Server=tcp:{server},1433;"
-              f"Database={database};"
-              f"Uid={username};"
-              f"Pwd={password};"
-              "Encrypt=yes;TrustServerCertificate=no;Connection Timeout=60;"
-          )
-          print("Attempting test connection...")
-          with pyodbc.connect(conn_str) as conn:
-              cur = conn.cursor()
-              cur.execute("SELECT 1")
-              print("Test query result:", cur.fetchone()[0])
+          cs = ("Driver=ODBC Driver 18 for SQL Server;"
+                f"Server=tcp:{os.getenv('AZURE_SQL_SERVER')},1433;"
+                f"Database={os.getenv('AZURE_SQL_DATABASE')};"
+                f"Uid={os.getenv('AZURE_SQL_USERNAME')};"
+                f"Pwd={os.getenv('AZURE_SQL_PASSWORD')};"
+                "Encrypt=yes;TrustServerCertificate=no;Connection Timeout=60;")
+          print("Attempting test connection…")
+          with pyodbc.connect(cs) as conn:
+              cur = conn.cursor(); cur.execute("SELECT 1"); print("SELECT 1 ->", cur.fetchone()[0])
           print("Connectivity OK")
           PY
-          python check_conn.py
 
       - name: Run bulk metadata sync
         run: python sync_yearly_company_metadata.py
 
-      # Always clean up the firewall rule
       - name: Remove runner IP from firewall
         if: always()
-        env:
-          AZ_SUBSCRIPTION: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
-          AZ_RG:           ${{ secrets.AZURE_RESOURCE_GROUP }}
-          AZ_SQL_NAME:     ${{ secrets.AZURE_SQL_SERVER_NAME }}
         run: |
-          az account set --subscription "$AZ_SUBSCRIPTION"
+          az account set --subscription "$AZ_SUBSCRIPTION" || true
           az sql server firewall-rule delete \
             --resource-group "$AZ_RG" \
             --server "$AZ_SQL_NAME" \
