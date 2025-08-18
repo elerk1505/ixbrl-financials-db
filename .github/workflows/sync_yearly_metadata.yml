@@ -34,7 +34,7 @@ jobs:
       TIMEOUT: "20"
       MAX_PER_RUN:  ${{ github.event.inputs.MAX_PER_RUN }}
       SINCE_DAYS:   ${{ github.event.inputs.SINCE_DAYS }}
-      FORCE_REFETCH:${{ github.event.inputs.FORCE_REFETCH }}
+      FORCE_REFETCH:  ${{ github.event.inputs.FORCE_REFETCH }}
 
     steps:
       - uses: actions/checkout@v4
