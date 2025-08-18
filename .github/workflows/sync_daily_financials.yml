@@ -6,6 +6,7 @@ on:
   workflow_dispatch: {}
 
 permissions:
+  id-token: write     # required for OIDC login
   contents: read
 
 concurrency:
@@ -16,6 +17,17 @@ jobs:
   sync-daily-ixbrl:
     runs-on: ubuntu-latest
     timeout-minutes: 120
+    env:
+      # Python code expects these FOUR names exactly:
+      AZURE_SQL_SERVER:   ${{ secrets.AZURE_SQL_SERVER }}        # e.g. ixbrl-sql-server.database.windows.net
+      AZURE_SQL_DATABASE: ${{ secrets.AZURE_SQL_DATABASE }}      # e.g. ixbrl_financials
+      AZURE_SQL_USERNAME: ${{ secrets.AZURE_SQL_USERNAME }}      # often user@ixbrl-sql-server
+      AZURE_SQL_PASSWORD: ${{ secrets.AZURE_SQL_PASSWORD }}
+
+      # Azure CLI (for firewall open/close)
+      AZ_SUBSCRIPTION:    ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      AZ_RG:              ${{ secrets.AZURE_RESOURCE_GROUP }}     # ixbrl-financials-rg
+      AZ_SQL_NAME:        ${{ secrets.AZURE_SQL_SERVER_NAME }}    # ixbrl-sql-server
 
     steps:
       - name: Checkout
@@ -27,29 +39,72 @@ jobs:
           python-version: "3.11"
           cache: "pip"
 
+      # OIDC login (no client secret)
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id:       ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id:       ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      # Temporarily allow this runner's IP to reach Azure SQL
+      - name: Allow runner IP in Azure SQL firewall
+        shell: bash
+        run: |
+          set -euo pipefail
+          az account set --subscription "$AZ_SUBSCRIPTION"
+          RUNNER_IP=$(curl -s https://api.ipify.org)
+          echo "Runner public IP: $RUNNER_IP"
+          RULE_NAME="gha-${{ github.run_id }}"
+          az sql server firewall-rule create \
+            --resource-group "$AZ_RG" \
+            --server "$AZ_SQL_NAME" \
+            --name "$RULE_NAME" \
+            --start-ip-address "$RUNNER_IP" \
+            --end-ip-address "$RUNNER_IP"
+          echo "FW_RULE_NAME=$RULE_NAME" >> "$GITHUB_ENV"
+
       - name: Install system deps (ODBC)
         run: |
           sudo su -c 'curl https://packages.microsoft.com/keys/microsoft.asc | apt-key add -'
-          sudo su -c 'curl https://packages.microsoft.com/config/ubuntu/22.04/prod.list \
-            > /etc/apt/sources.list.d/mssql-release.list'
+          sudo su -c 'curl https://packages.microsoft.com/config/ubuntu/22.04/prod.list > /etc/apt/sources.list.d/mssql-release.list'
           sudo apt-get update
           sudo ACCEPT_EULA=Y apt-get install -y msodbcsql18 unixodbc-dev
 
       - name: Install Python deps
         run: |
           python -m pip install --upgrade pip
+          # use requirements.txt if you have one; otherwise keep this line:
           pip install httpx pandas stream-read-xbrl sqlalchemy pyodbc
 
-      - name: Run daily ingest (handles Tue batch + skips 404s)
-        env:
-          AZURE_SQL_SERVER:   ${{ secrets.AZURE_SQL_SERVER }}
-          AZURE_SQL_DB:       ${{ secrets.AZURE_SQL_DB }}
-          AZURE_SQL_USER:     ${{ secrets.AZURE_SQL_USER }}
-          AZURE_SQL_PASSWORD: ${{ secrets.AZURE_SQL_PASSWORD }}
+      # (optional) quick connectivity test
+      - name: Connectivity check
+        shell: bash
         run: |
-          python sync_latest_ixbrl.py
+          python - <<'PY'
+          import os, pyodbc
+          cs = ("Driver=ODBC Driver 18 for SQL Server;"
+                f"Server=tcp:{os.getenv('AZURE_SQL_SERVER')},1433;"
+                f"Database={os.getenv('AZURE_SQL_DATABASE')};"
+                f"Uid={os.getenv('AZURE_SQL_USERNAME')};"
+                f"Pwd={os.getenv('AZURE_SQL_PASSWORD')};"
+                "Encrypt=yes;TrustServerCertificate=no;Connection Timeout=60;")
+          with pyodbc.connect(cs) as c:
+              cur=c.cursor(); cur.execute("SELECT 1"); print("SELECT 1 ->", cur.fetchone()[0])
+          PY
 
-      - name: Summary
+      - name: Run daily ingest (handles Tue batch + skips 404s)
+        run: python sync_latest_ixbrl.py
+
+      # Always close the firewall rule
+      - name: Remove runner IP from firewall
         if: always()
+        shell: bash
         run: |
-          echo "Daily iXBRL ingest finished. Check previous step logs for processed dates."
+          set -euo pipefail
+          az account set --subscription "$AZ_SUBSCRIPTION" || true
+          az sql server firewall-rule delete \
+            --resource-group "$AZ_RG" \
+            --server "$AZ_SQL_NAME" \
+            --name "$FW_RULE_NAME" \
+            --yes || true
