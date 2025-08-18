@@ -1,138 +1,55 @@
-# sync_latest_ixbrl.py
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
+name: Daily iXBRL Financials Sync → Azure SQL
 
-import os
-import sqlite3
-from pathlib import Path
-from datetime import datetime, timedelta
+on:
+  schedule:
+    - cron: "5 5 * * *"   # every day at 05:05 UTC
+  workflow_dispatch: {}
 
-import pandas as pd
-import httpx
-from stream_read_xbrl import stream_read_xbrl_zip
+permissions:
+  contents: read
 
-OUTPUT_DIR = Path("yearly_sqlites")
-TABLE = "financials"
-HTTP_TIMEOUT = 90.0
-BATCH_ROWS = 200_000
+concurrency:
+  group: daily-ixbrl-to-azure
+  cancel-in-progress: false
 
-def normalize_df(df: pd.DataFrame) -> pd.DataFrame:
-    # company_number
-    if "company_number" in df.columns:
-        df["company_number"] = df["company_number"].astype(str).str.replace(" ", "", regex=False)
-    elif "companies_house_registered_number" in df.columns:
-        df["company_number"] = df["companies_house_registered_number"].astype(str).str.replace(" ", "", regex=False)
-    # standardise period_end
-    for cand in ("period_end", "balance_sheet_date", "date_end", "yearEnd"):
-        if cand in df.columns and "period_end" not in df.columns:
-            df = df.rename(columns={cand: "period_end"})
-            break
-    return df
+jobs:
+  sync-daily-ixbrl:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
 
-def upsert_df(df: pd.DataFrame, db_path: Path, table: str = TABLE) -> None:
-    df = normalize_df(df)
-    db_path.parent.mkdir(parents=True, exist_ok=True)
-    with sqlite3.connect(db_path) as con:
-        df.to_sql("_staging", con, if_exists="replace", index=False)
-        cur = con.cursor()
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
 
-        tgt_cols = [r[1] for r in cur.execute(f'PRAGMA table_info("{table}")')]
-        stg_cols = [r[1] for r in cur.execute('PRAGMA table_info("_staging")')]
-        stg_set = set(stg_cols)
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
 
-        if not tgt_cols:
-            cols_sql = ", ".join([f'"{c}"' for c in stg_cols]) or "dummy INTEGER"
-            cur.execute(f'CREATE TABLE IF NOT EXISTS "{table}" ({cols_sql})')
-            tgt_cols = stg_cols
+      - name: Install system deps (ODBC)
+        run: |
+          sudo su -c 'curl https://packages.microsoft.com/keys/microsoft.asc | apt-key add -'
+          sudo su -c 'curl https://packages.microsoft.com/config/ubuntu/22.04/prod.list \
+            > /etc/apt/sources.list.d/mssql-release.list'
+          sudo apt-get update
+          sudo ACCEPT_EULA=Y apt-get install -y msodbcsql18 unixodbc-dev
 
-        for c in stg_cols:
-            if c not in tgt_cols:
-                cur.execute(f'ALTER TABLE "{table}" ADD COLUMN "{c}"')
+      - name: Install Python deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install httpx pandas stream-read-xbrl sqlalchemy pyodbc
 
-        col_list = ", ".join([f'"{c}"' for c in stg_cols])
-        if {"company_number", "period_end"}.issubset(stg_set):
-            cur.execute(f'CREATE UNIQUE INDEX IF NOT EXISTS ux_{table}_company_period ON "{table}"(company_number, period_end)')
-            cur.execute(f'INSERT OR REPLACE INTO "{table}" ({col_list}) SELECT {col_list} FROM "_staging"')
-        else:
-            cur.execute(f'INSERT INTO "{table}" ({col_list}) SELECT {col_list} FROM "_staging"')
+      - name: Run daily ingest (handles Tue batch + skips 404s)
+        env:
+          AZURE_SQL_SERVER:   ${{ secrets.AZURE_SQL_SERVER }}
+          AZURE_SQL_DB:       ${{ secrets.AZURE_SQL_DB }}
+          AZURE_SQL_USER:     ${{ secrets.AZURE_SQL_USER }}
+          AZURE_SQL_PASSWORD: ${{ secrets.AZURE_SQL_PASSWORD }}
+        run: |
+          python sync_latest_ixbrl_to_azure.py
 
-        cur.execute('DROP TABLE IF EXISTS "_staging"')
-        if "company_number" in stg_set:
-            cur.execute(f'CREATE INDEX IF NOT EXISTS ix_{table}_company ON "{table}"(company_number)')
-        if "period_end" in stg_set:
-            cur.execute(f'CREATE INDEX IF NOT EXISTS ix_{table}_period ON "{table}"(period_end)')
-        con.commit()
-
-def db_for_halfyear(ts: pd.Timestamp) -> Path:
-    half = 1 if ts.month <= 6 else 2
-    return OUTPUT_DIR / f"{ts.year}_{half}.sqlite"
-
-def flush_batch(buffer, columns) -> int:
-    df = pd.DataFrame(buffer, columns=columns)
-    df["balance_sheet_date"] = pd.to_datetime(df.get("balance_sheet_date"), errors="coerce")
-    df = df.dropna(subset=["balance_sheet_date"])
-    if df.empty:
-        return 0
-    total = 0
-    df["half"] = (df["balance_sheet_date"].dt.month <= 6).map({True: 1, False: 2})
-    df["year"] = df["balance_sheet_date"].dt.year
-    for (year, half), part in df.groupby(["year", "half"]):
-        upsert_df(part, db_for_halfyear(pd.Timestamp(year=int(year), month=(1 if half == 1 else 7), day=1)))
-        total += len(part)
-    return total
-
-def process_daily_zip(date_str: str) -> int:
-    """
-    Try to fetch the daily ZIP for date_str (YYYY-MM-DD).
-    Returns rows ingested. Silently skips 404/Not Found.
-    """
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    url = f"https://download.companieshouse.gov.uk/Accounts_Bulk_Data-{date_str}.zip"
-    print(f"📦 Checking: {url}")
-    try:
-        with httpx.stream("GET", url, timeout=HTTP_TIMEOUT) as r:
-            r.raise_for_status()
-            buffer, rows = [], 0
-            with stream_read_xbrl_zip(r.iter_bytes()) as (columns, row_iter):
-                for row in row_iter:
-                    buffer.append([("" if v is None else str(v)) for v in row])
-                    if len(buffer) >= BATCH_ROWS:
-                        rows += flush_batch(buffer, columns)
-                        buffer.clear()
-                if buffer:
-                    rows += flush_batch(buffer, columns)
-                    buffer.clear()
-            print(f"✅ {date_str}: upserted {rows:,} rows")
-            return rows
-    except httpx.HTTPStatusError as e:
-        if e.response.status_code == 404:
-            print(f"ℹ️ {date_str}: no file published (404). Skipping.")
-            return 0
-        print(f"⚠️ {date_str}: HTTP {e.response.status_code}. Skipping.")
-        return 0
-    except Exception as e:
-        # Don’t fail the workflow; just log and continue
-        print(f"⚠️ {date_str}: error {e}. Skipping.")
-        return 0
-
-def main():
-    # Look back a few days so Tuesday can catch Sat–Mon, and to recover if a run was missed.
-    lookback = int(os.getenv("LOOKBACK_DAYS", "4"))
-    today = datetime.utcnow().date()
-    total_rows = 0
-    for d in range(lookback):
-        day = today - timedelta(days=d)
-        total_rows += process_daily_zip(day.strftime("%Y-%m-%d"))
-    print(f"Done. Total rows upserted across last {lookback} day(s): {total_rows:,}")
-    # Always exit 0 to avoid failure emails when no file exists
-    return 0
-
-if __name__ == "__main__":
-    try:
-        raise SystemExit(main())
-    except SystemExit as se:
-        raise se
-    except Exception as e:
-        # Belt & braces: never fail the workflow
-        print(f"⚠️ Unexpected error: {e}")
-        raise SystemExit(0)
+      - name: Summary
+        if: always()
+        run: |
+          echo "Daily iXBRL ingest finished. Check previous step logs for processed dates."
