@@ -106,10 +106,6 @@ def distinct_company_numbers_from_financials():
 def upsert_financials_dataframe(df: pd.DataFrame,
                                 target_table: str = "dbo.financials",
                                 key_cols=None):
-    """
-    Writes DF into a transient staging table then MERGEs into target.
-    Keeps existing behavior so the daily job remains unchanged.
-    """
     if df is None or df.empty:
         return
     if key_cols is None:
@@ -121,7 +117,7 @@ def upsert_financials_dataframe(df: pd.DataFrame,
     stage = f"_stg_fin_{uuid.uuid4().hex[:8]}"
     eng = engine()
     with eng.begin() as con:
-        # Create/replace staging
+        # Load into staging table
         df.to_sql(stage, con=con, schema="dbo", if_exists="replace",
                   index=False, method="multi", chunksize=1000)
 
@@ -131,13 +127,12 @@ def upsert_financials_dataframe(df: pd.DataFrame,
         insert_cols = ", ".join(f"[{c}]" for c in cols)
         insert_vals = ", ".join(f"s.[{c}]" for c in cols)
 
-        # MERGE into target; then drop staging
+        # Merge into permanent table
         con.execute(text(f"""
             MERGE {target_table} AS t
             USING (SELECT * FROM dbo.{stage}) AS s
               ON {on_clause}
             WHEN MATCHED THEN UPDATE SET {set_clause}
             WHEN NOT MATCHED THEN INSERT ({insert_cols}) VALUES ({insert_vals});
-
             DROP TABLE dbo.{stage};
-        """))
+        """)))
