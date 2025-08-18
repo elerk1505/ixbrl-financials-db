@@ -38,6 +38,7 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -77,35 +78,34 @@ jobs:
           sudo ACCEPT_EULA=Y apt-get install -y msodbcsql18 unixodbc-dev
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          python - << 'PY'
-import pyodbc
-print("Available ODBC drivers:", pyodbc.drivers())
-PY
+          python -c "import pyodbc; print('Available ODBC drivers:', pyodbc.drivers())"
 
       # (Optional) sanity check connectivity before running your script
       - name: Connectivity check
+        shell: bash
         run: |
-          python - << 'PY'
-import os, urllib.parse, pyodbc
-server   = os.getenv("AZURE_SQL_SERVER")
-database = os.getenv("AZURE_SQL_DATABASE")
-username = os.getenv("AZURE_SQL_USERNAME")
-password = os.getenv("AZURE_SQL_PASSWORD")
-conn_str = (
-    f"Driver=ODBC Driver 18 for SQL Server;"
-    f"Server=tcp:{server},1433;"
-    f"Database={database};"
-    f"Uid={username};"
-    f"Pwd={password};"
-    "Encrypt=yes;TrustServerCertificate=no;Connection Timeout=60;"
-)
-print("Attempting test connection...")
-with pyodbc.connect(conn_str) as conn:
-    cur = conn.cursor()
-    cur.execute("SELECT 1")
-    print("Test query result:", cur.fetchone()[0])
-print("Connectivity OK")
-PY
+          cat > check_conn.py <<'PY'
+          import os, pyodbc
+          server   = os.getenv("AZURE_SQL_SERVER")
+          database = os.getenv("AZURE_SQL_DATABASE")
+          username = os.getenv("AZURE_SQL_USERNAME")
+          password = os.getenv("AZURE_SQL_PASSWORD")
+          conn_str = (
+              "Driver=ODBC Driver 18 for SQL Server;"
+              f"Server=tcp:{server},1433;"
+              f"Database={database};"
+              f"Uid={username};"
+              f"Pwd={password};"
+              "Encrypt=yes;TrustServerCertificate=no;Connection Timeout=60;"
+          )
+          print("Attempting test connection...")
+          with pyodbc.connect(conn_str) as conn:
+              cur = conn.cursor()
+              cur.execute("SELECT 1")
+              print("Test query result:", cur.fetchone()[0])
+          print("Connectivity OK")
+          PY
+          python check_conn.py
 
       - name: Run bulk metadata sync
         run: python sync_yearly_company_metadata.py
