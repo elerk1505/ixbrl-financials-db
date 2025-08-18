@@ -63,7 +63,6 @@ jobs:
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
       - name: Allow runner IP in Azure SQL firewall
-        shell: bash
         run: |
           set -euo pipefail
           az account set --subscription "$AZ_SUBSCRIPTION"
@@ -76,7 +75,25 @@ jobs:
             --name "$RULE_NAME" \
             --start-ip-address "$RUNNER_IP" \
             --end-ip-address "$RUNNER_IP"
-          echo "FW_RULE_NAME=$RULE_NAME" >> "$GITHUB_ENV"
+          echo "FW_RULE_NAME=$RULE_NAME" >> $GITHUB_ENV
+
+          # Show server + rule to catch wrong RG/server quickly
+          echo "Verifying firewall rule was created on the intended server…"
+          az sql server show --resource-group "$AZ_RG" --name "$AZ_SQL_NAME" -o table
+          az sql server firewall-rule show --resource-group "$AZ_RG" --server "$AZ_SQL_NAME" --name "$RULE_NAME" -o table
+
+          # Give Azure a moment to propagate the rule
+          echo "Waiting ~20s for firewall propagation…"
+          sleep 20
+
+      - name: Quick TCP reachability check (1433)
+        run: |
+          set -euo pipefail
+          # Install a tiny TCP client
+          sudo apt-get update -y
+          sudo apt-get install -y netcat-openbsd
+          echo "Testing TCP to ${AZURE_SQL_SERVER}:1433"
+          nc -vz ${AZURE_SQL_SERVER} 1433
 
       - name: Install system deps (ODBC)
         run: |
@@ -91,7 +108,6 @@ jobs:
           pip install -r requirements.txt || pip install aiohttp pandas sqlalchemy pyodbc httpx stream-read-xbrl
 
       - name: Connectivity check
-        shell: bash
         run: |
           python - <<'PY'
           import os, pyodbc
@@ -100,9 +116,14 @@ jobs:
                 f"Database={os.getenv('AZURE_SQL_DATABASE')};"
                 f"Uid={os.getenv('AZURE_SQL_USERNAME')};"
                 f"Pwd={os.getenv('AZURE_SQL_PASSWORD')};"
-                "Encrypt=yes;TrustServerCertificate=no;Connection Timeout=60;")
-          with pyodbc.connect(cs) as c:
-              cur=c.cursor(); cur.execute("SELECT 1"); print("SELECT 1 ->", cur.fetchone()[0])
+                "Encrypt=yes;TrustServerCertificate=no;"
+                "Connection Timeout=90;")   # slightly higher
+          print("Attempting test connection…")
+          with pyodbc.connect(cs) as conn:
+              cur = conn.cursor()
+              cur.execute("SELECT 1")
+              print("SELECT 1 ->", cur.fetchone()[0])
+          print("Connectivity OK")
           PY
 
       - name: Run bulk metadata sync
