@@ -1,8 +1,8 @@
-name: Daily iXBRL Financials Sync (daily ZIP → Azure SQL)
+name: Daily iXBRL Financials Sync → Azure SQL
 
 on:
   schedule:
-    - cron: "5 5 * * *"   # every day at 05:05 UTC
+    - cron: "5 5 * * *"
   workflow_dispatch: {}
 
 permissions:
@@ -12,10 +12,15 @@ jobs:
   sync-daily-ixbrl:
     runs-on: ubuntu-latest
     timeout-minutes: 120
+    env:
+      AZURE_SQL_SERVER:   ${{ secrets.AZURE_SQL_SERVER }}
+      AZURE_SQL_DATABASE: ${{ secrets.AZURE_SQL_DATABASE }}
+      AZURE_SQL_USERNAME: ${{ secrets.AZURE_SQL_USERNAME }}
+      AZURE_SQL_PASSWORD: ${{ secrets.AZURE_SQL_PASSWORD }}
+      AZURE_SQL_CONN:     ${{ secrets.AZURE_SQL_CONN }}
 
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -23,22 +28,14 @@ jobs:
           python-version: "3.11"
           cache: "pip"
 
-      - name: Install dependencies
+      - name: Install ODBC driver (msodbcsql18) & build deps
         run: |
+          sudo su -c 'curl https://packages.microsoft.com/keys/microsoft.asc | apt-key add -'
+          sudo su -c 'curl https://packages.microsoft.com/config/ubuntu/22.04/prod.list > /etc/apt/sources.list.d/mssql-release.list'
+          sudo apt-get update
+          sudo ACCEPT_EULA=Y apt-get install -y msodbcsql18 unixodbc-dev
           python -m pip install --upgrade pip
-          pip install pandas httpx stream-read-xbrl pyodbc sqlalchemy
+          pip install -r requirements.txt
 
-      - name: Run daily ingest and push to Azure SQL
-        env:
-          CH_API_KEY: ${{ secrets.CH_API_KEY }}
-          AZURE_SQL_SERVER: ${{ secrets.AZURE_SQL_SERVER }}
-          AZURE_SQL_DATABASE: ${{ secrets.AZURE_SQL_DATABASE }}
-          AZURE_SQL_USERNAME: ${{ secrets.AZURE_SQL_USERNAME }}
-          AZURE_SQL_PASSWORD: ${{ secrets.AZURE_SQL_PASSWORD }}
-          AZURE_SQL_CONN: ${{ secrets.AZURE_SQL_CONN }}
-        run: |
-          python sync_latest_ixbrl.py \
-            --azure-server "$AZURE_SQL_SERVER" \
-            --azure-db "$AZURE_SQL_DATABASE" \
-            --azure-user "$AZURE_SQL_USERNAME" \
-            --azure-pass "$AZURE_SQL_PASSWORD"
+      - name: Run daily ingest → Azure
+        run: python sync_latest_ixbrl.py
