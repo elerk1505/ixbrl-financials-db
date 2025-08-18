@@ -3,65 +3,75 @@ import os
 import urllib.parse
 from sqlalchemy import create_engine
 from sqlalchemy.engine.url import make_url
+from typing import Optional
+
+# Toggle batch performance only for pyodbc
+def engine(fast: bool = True):
+    url = build_conn_str()
+    # Validate early; raises ArgumentError if malformed
+    make_url(url)
+    # fast_executemany is only effective for mssql+pyodbc
+    kwargs = {"pool_pre_ping": True}
+    if url.startswith("mssql+pyodbc://"):
+        kwargs["fast_executemany"] = fast
+    return create_engine(url, **kwargs)
 
 def build_conn_str() -> str:
     """
-    Returns a SQLAlchemy-compatible URL for SQL Server via pyodbc.
-    Supports:
-      - AZURE_SQL_CONN: full ODBC conn string (Driver=...;Server=...;Database=...;Uid=...;Pwd=...;...)
-      - OR the 4 separate env vars (server, database, username, password)
+    Priority:
+      1) AZURE_SQL_CONN – must be a valid SQLAlchemy URL (not raw ODBC)
+      2) Construct DSN-less mssql+pyodbc URL from SERVER/DB/USER/PASS envs
     """
-    odbc = (os.getenv("AZURE_SQL_CONN") or "").strip()
-    if odbc:
-        # If a raw ODBC string was provided, wrap it in ?odbc_connect=
-        # This avoids URL-escaping headaches and works with special chars.
-        if "Driver=" in odbc or "DRIVER=" in odbc:
-            return "mssql+pyodbc:///?odbc_connect=" + urllib.parse.quote_plus(odbc)
-        # If it's already a SQLAlchemy URL, just return it.
-        return odbc
+    conn = (os.getenv("AZURE_SQL_CONN") or "").strip()
+    if conn:
+        # Accept either:
+        #   mssql+pyodbc://user:pass@host:1433/db?driver=ODBC+Driver+18+for+SQL+Server&Encrypt=yes&TrustServerCertificate=no
+        # or:
+        #   mssql+pyodbc:///?odbc_connect=<urlencoded ODBC string>
+        return conn
 
-    # Fall back to individual parts
-    server   = (os.getenv("AZURE_SQL_SERVER") or "").strip()
-    database = (os.getenv("AZURE_SQL_DATABASE") or "").strip()
-    username = (os.getenv("AZURE_SQL_USERNAME") or "").strip()
-    password = (os.getenv("AZURE_SQL_PASSWORD") or "").strip()
+    server   = os.getenv("AZURE_SQL_SERVER", "").strip()
+    database = os.getenv("AZURE_SQL_DATABASE", "").strip()
+    username = os.getenv("AZURE_SQL_USERNAME", "").strip()
+    password = os.getenv("AZURE_SQL_PASSWORD", "").strip()
 
-    if not all([server, database, username, password]):
-        raise RuntimeError(
-            "Missing SQL settings. Provide AZURE_SQL_CONN (ODBC string) "
-            "or AZURE_SQL_SERVER, AZURE_SQL_DATABASE, AZURE_SQL_USERNAME, AZURE_SQL_PASSWORD."
+    if not (server and database and username and password):
+        raise ValueError(
+            "Missing one or more required env vars: AZURE_SQL_SERVER, AZURE_SQL_DATABASE, "
+            "AZURE_SQL_USERNAME, AZURE_SQL_PASSWORD (or provide AZURE_SQL_CONN)."
         )
 
-    # Compose a standard SQLAlchemy URL. Escape user/pass because they may contain special chars.
-    q_user = urllib.parse.quote_plus(username)
-    q_pwd  = urllib.parse.quote_plus(password)
+    # Build a DSN-less ODBC connect string and URL-encode it
+    odbc = (
+        f"Driver=ODBC Driver 18 for SQL Server;"
+        f"Server=tcp:{server},1433;"
+        f"Database={database};"
+        f"Uid={username};"
+        f"Pwd={password};"
+        f"Encrypt=yes;TrustServerCertificate=no;Connection Timeout=30;"
+    )
+    odbc_enc = urllib.parse.quote_plus(odbc)
+    return f"mssql+pyodbc:///?odbc_connect={odbc_enc}"
 
-    # Use the officially installed driver name; keep port 1433 explicit.
-    driver_qs = urllib.parse.urlencode({
-        "driver": "ODBC Driver 18 for SQL Server",
-        "Encrypt": "yes",
-        "TrustServerCertificate": "no",
-    })
-
-    # For Azure SQL, server should be like "yourserver.database.windows.net"
-    # Do NOT include "tcp:" or ",1433" here; port is specified separately.
-    return f"mssql+pyodbc://{q_user}:{q_pwd}@{server}:1433/{database}?{driver_qs}"
-
-def engine(fast: bool = True):
-    url = build_conn_str()
-
-    # Validate URL early (raises on malformed strings)
-    try:
-        make_url(url)
-    except Exception as e:
-        raise RuntimeError(f"Invalid SQLAlchemy URL built: {url}") from e
-
-    return create_engine(url, fast_executemany=fast, pool_pre_ping=True)
+# ------- optional helpers you already import elsewhere -------
+from sqlalchemy import text
 
 def ensure_company_profiles_table():
-    # your existing implementation…
-    pass
+    ddl = """
+    IF NOT EXISTS (SELECT * FROM sys.objects WHERE object_id = OBJECT_ID(N'[dbo].[company_profiles]') AND type in (N'U'))
+    CREATE TABLE [dbo].[company_profiles](
+      company_number nvarchar(64) NOT NULL PRIMARY KEY,
+      fetched_at nvarchar(64)     NOT NULL,
+      http_status int             NULL,
+      etag nvarchar(256)          NULL,
+      payload_json nvarchar(max)  NULL,
+      error nvarchar(4000)        NULL
+    );
+    """
+    with engine().begin() as con:
+        con.execute(text(ddl))
 
 def distinct_company_numbers_from_financials():
-    # your existing implementation…
-    return []
+    with engine().begin() as con:
+        # Adjust table/column names to your schema
+        return [r[0] for r in con.execute(text("SELECT DISTINCT companies_house_registered_number FROM dbo.financials WHERE companies_house_registered_number IS NOT NULL"))]
