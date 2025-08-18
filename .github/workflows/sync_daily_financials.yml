@@ -6,7 +6,7 @@ on:
   workflow_dispatch: {}
 
 permissions:
-  id-token: write     # required for OIDC login
+  id-token: write
   contents: read
 
 concurrency:
@@ -23,11 +23,13 @@ jobs:
       AZURE_SQL_DATABASE: ${{ secrets.AZURE_SQL_DATABASE }}      # e.g. ixbrl_financials
       AZURE_SQL_USERNAME: ${{ secrets.AZURE_SQL_USERNAME }}      # often user@ixbrl-sql-server
       AZURE_SQL_PASSWORD: ${{ secrets.AZURE_SQL_PASSWORD }}
+      # Optional/unused by current code (safe to keep or remove)
       AZURE_SQL_ODBC:     ${{ secrets.AZURE_SQL_ODBC }}
+
       # Azure CLI (for firewall open/close)
       AZ_SUBSCRIPTION:    ${{ secrets.AZURE_SUBSCRIPTION_ID }}
       AZ_RG:              ${{ secrets.AZURE_RESOURCE_GROUP }}     # ixbrl-financials-rg
-      AZ_SQL_NAME:        ${{ secrets.AZURE_SQL_SERVER_NAME }}    # ixbrl-sql-server
+      AZ_SQL_NAME:        ${{ secrets.AZURE_SQL_SERVER_NAME }}    # short name, e.g. ixbrl-sql-server
 
     steps:
       - name: Checkout
@@ -63,6 +65,8 @@ jobs:
             --start-ip-address "$RUNNER_IP" \
             --end-ip-address "$RUNNER_IP"
           echo "FW_RULE_NAME=$RULE_NAME" >> "$GITHUB_ENV"
+          # give the rule a moment to propagate
+          sleep 8
 
       - name: Install system deps (ODBC)
         run: |
@@ -76,20 +80,33 @@ jobs:
           python -m pip install --upgrade pip
           pip install httpx pandas stream-read-xbrl sqlalchemy pyodbc
 
-      # Optional connectivity check
-      - name: Connectivity check
+      - name: Connectivity check (with retries)
         shell: bash
         run: |
           python - <<'PY'
-          import os, pyodbc
+          import os, time, pyodbc
+
           cs = ("Driver=ODBC Driver 18 for SQL Server;"
                 f"Server=tcp:{os.getenv('AZURE_SQL_SERVER')},1433;"
                 f"Database={os.getenv('AZURE_SQL_DATABASE')};"
                 f"Uid={os.getenv('AZURE_SQL_USERNAME')};"
                 f"Pwd={os.getenv('AZURE_SQL_PASSWORD')};"
-                "Encrypt=yes;TrustServerCertificate=no;Connection Timeout=60;")
-          with pyodbc.connect(cs) as c:
-              cur=c.cursor(); cur.execute("SELECT 1"); print("SELECT 1 ->", cur.fetchone()[0])
+                "Encrypt=yes;TrustServerCertificate=no;Connection Timeout=90;")
+
+          last_err = None
+          for attempt in range(1, 4):
+              try:
+                  print(f"Attempt {attempt}: connecting…")
+                  with pyodbc.connect(cs) as c:
+                      cur=c.cursor(); cur.execute("SELECT 1"); print("SELECT 1 ->", cur.fetchone()[0])
+                  print("Connectivity OK")
+                  break
+              except Exception as e:
+                  last_err = e
+                  print(f"Connect failed: {e}")
+                  time.sleep(6 * attempt)
+          else:
+              raise SystemExit(f"Connectivity failed after retries: {last_err}")
           PY
 
       - name: Run daily ingest (5-day rolling lookback)
@@ -105,4 +122,5 @@ jobs:
           az sql server firewall-rule delete \
             --resource-group "$AZ_RG" \
             --server "$AZ_SQL_NAME" \
-            --name "$FW_RULE_NAME" || true
+            --name "$FW_RULE_NAME" \
+            --yes || true
