@@ -2,10 +2,11 @@ name: Daily Company Metadata Sync → Azure
 
 on:
   schedule:
-    - cron: "0 6 * * *"
+    - cron: "0 6 * * *"   # 06:00 UTC daily
   workflow_dispatch: {}
 
 permissions:
+  id-token: write          # required for OIDC
   contents: read
 
 jobs:
@@ -13,22 +14,58 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 120
     env:
+      # App/API
       CH_API_KEY:         ${{ secrets.CH_API_KEY }}
-      AZURE_SQL_SERVER:   ${{ secrets.AZURE_SQL_SERVER }}
-      AZURE_SQL_DATABASE: ${{ secrets.AZURE_SQL_DATABASE }}
-      AZURE_SQL_USERNAME: ${{ secrets.AZURE_SQL_USERNAME }}
+
+      # DB envs used by scripts.azure_sql.py
+      AZURE_SQL_SERVER:   ${{ secrets.AZURE_SQL_SERVER }}        # e.g. ixbrl-sql-server.database.windows.net
+      AZURE_SQL_DATABASE: ${{ secrets.AZURE_SQL_DATABASE }}      # e.g. ixbrl_financials
+      AZURE_SQL_USERNAME: ${{ secrets.AZURE_SQL_USERNAME }}      # often user@ixbrl-sql-server
       AZURE_SQL_PASSWORD: ${{ secrets.AZURE_SQL_PASSWORD }}
+
+      # Tuning knobs for fetch_company_metadata.py
       CONCURRENCY: "8"
       TIMEOUT: "20"
       SINCE_DAYS: "30"
       MAX_PER_RUN: "50000"
 
+      # Azure CLI for firewall open/close
+      AZ_SUBSCRIPTION:    ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      AZ_RG:              ${{ secrets.AZURE_RESOURCE_GROUP }}     # ixbrl-financials-rg
+      AZ_SQL_NAME:        ${{ secrets.AZURE_SQL_SERVER_NAME }}    # ixbrl-sql-server
+
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
           cache: "pip"
+
+      # OIDC login (no client secret)
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id:       ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id:       ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      # Temporarily allow this runner's IP to reach Azure SQL
+      - name: Allow runner IP in Azure SQL firewall
+        shell: bash
+        run: |
+          set -euo pipefail
+          az account set --subscription "$AZ_SUBSCRIPTION"
+          RUNNER_IP=$(curl -s https://api.ipify.org)
+          echo "Runner public IP: $RUNNER_IP"
+          RULE_NAME="gha-${{ github.run_id }}"
+          az sql server firewall-rule create \
+            --resource-group "$AZ_RG" \
+            --server "$AZ_SQL_NAME" \
+            --name "$RULE_NAME" \
+            --start-ip-address "$RUNNER_IP" \
+            --end-ip-address "$RUNNER_IP"
+          echo "FW_RULE_NAME=$RULE_NAME" >> "$GITHUB_ENV"
 
       - name: ODBC + deps
         run: |
@@ -37,7 +74,37 @@ jobs:
           sudo apt-get update
           sudo ACCEPT_EULA=Y apt-get install -y msodbcsql18 unixodbc-dev
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          # use your requirements.txt if you have one; else ensure these are installed:
+          pip install -r requirements.txt || pip install aiohttp pandas sqlalchemy pyodbc httpx stream-read-xbrl
+
+      # (optional) quick connectivity test
+      - name: Connectivity check
+        shell: bash
+        run: |
+          python - <<'PY'
+          import os, pyodbc
+          cs = ("Driver=ODBC Driver 18 for SQL Server;"
+                f"Server=tcp:{os.getenv('AZURE_SQL_SERVER')},1433;"
+                f"Database={os.getenv('AZURE_SQL_DATABASE')};"
+                f"Uid={os.getenv('AZURE_SQL_USERNAME')};"
+                f"Pwd={os.getenv('AZURE_SQL_PASSWORD')};"
+                "Encrypt=yes;TrustServerCertificate=no;Connection Timeout=60;")
+          with pyodbc.connect(cs) as c:
+              cur=c.cursor(); cur.execute("SELECT 1"); print("SELECT 1 ->", cur.fetchone()[0])
+          PY
 
       - name: Run metadata sync
         run: python sync_company_metadata.py
+
+      # Always close the firewall rule
+      - name: Remove runner IP from firewall
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          az account set --subscription "$AZ_SUBSCRIPTION" || true
+          az sql server firewall-rule delete \
+            --resource-group "$AZ_RG" \
+            --server "$AZ_SQL_NAME" \
+            --name "$FW_RULE_NAME" \
+            --yes || true
