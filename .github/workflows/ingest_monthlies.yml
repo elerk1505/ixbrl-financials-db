@@ -17,6 +17,7 @@ on:
         default: ""
 
 permissions:
+  id-token: write          # ← required for OIDC
   contents: read
 
 jobs:
@@ -24,19 +25,49 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 720
     env:
-      AZURE_SQL_SERVER:   ${{ secrets.AZURE_SQL_SERVER }}
+      # Your Python code uses these:
+      AZURE_SQL_SERVER:   ${{ secrets.AZURE_SQL_SERVER }}        # e.g. ixbrl-sql-server.database.windows.net
       AZURE_SQL_DATABASE: ${{ secrets.AZURE_SQL_DATABASE }}
-      AZURE_SQL_USERNAME: ${{ secrets.AZURE_SQL_USERNAME }}
+      AZURE_SQL_USERNAME: ${{ secrets.AZURE_SQL_USERNAME }}      # often user@ixbrl-sql-server
       AZURE_SQL_PASSWORD: ${{ secrets.AZURE_SQL_PASSWORD }}
+
+      # Azure CLI for firewall:
+      AZ_SUBSCRIPTION:    ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      AZ_RG:              ${{ secrets.AZURE_RESOURCE_GROUP }}     # ixbrl-financials-rg
+      AZ_SQL_NAME:        ${{ secrets.AZURE_SQL_SERVER_NAME }}    # ixbrl-sql-server
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Python + ODBC
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
           cache: "pip"
+
+      # OIDC login (no client secret needed)
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id:       ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id:       ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      # Temporarily allow the runner IP to hit Azure SQL
+      - name: Allow runner IP in Azure SQL firewall
+        shell: bash
+        run: |
+          set -euo pipefail
+          az account set --subscription "$AZ_SUBSCRIPTION"
+          RUNNER_IP=$(curl -s https://api.ipify.org)
+          echo "Runner public IP: $RUNNER_IP"
+          RULE_NAME="gha-${{ github.run_id }}"
+          az sql server firewall-rule create \
+            --resource-group "$AZ_RG" \
+            --server "$AZ_SQL_NAME" \
+            --name "$RULE_NAME" \
+            --start-ip-address "$RUNNER_IP" \
+            --end-ip-address "$RUNNER_IP"
+          echo "FW_RULE_NAME=$RULE_NAME" >> "$GITHUB_ENV"
 
       - name: Install ODBC driver & deps
         run: |
@@ -47,10 +78,39 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      # (optional) quick connectivity test
+      - name: Connectivity check
+        shell: bash
+        run: |
+          python - <<'PY'
+          import os, pyodbc
+          cs = ("Driver=ODBC Driver 18 for SQL Server;"
+                f"Server=tcp:{os.getenv('AZURE_SQL_SERVER')},1433;"
+                f"Database={os.getenv('AZURE_SQL_DATABASE')};"
+                f"Uid={os.getenv('AZURE_SQL_USERNAME')};"
+                f"Pwd={os.getenv('AZURE_SQL_PASSWORD')};"
+                "Encrypt=yes;TrustServerCertificate=no;Connection Timeout=60;")
+          with pyodbc.connect(cs) as c:
+              cur=c.cursor(); cur.execute("SELECT 1"); print("SELECT 1 ->", cur.fetchone()[0])
+          PY
+
       - name: Ingest (choose year or start/end)
         run: |
           if [ -n "${{ github.event.inputs.YEAR }}" ]; then
-            python ingest_monthly_to_sqlite.py --year "${{ github.event.inputs.YEAR }}"
+            python ingest_monthly_financials.py --year "${{ github.event.inputs.YEAR }}"
           else
-            python ingest_monthly_to_sqlite.py --start "${{ github.event.inputs.START }}" --end "${{ github.event.inputs.END }}"
+            python ingest_monthly_financials.py --start "${{ github.event.inputs.START }}" --end "${{ github.event.inputs.END }}"
           fi
+
+      # Always close the firewall hole
+      - name: Remove runner IP from firewall
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          az account set --subscription "$AZ_SUBSCRIPTION" || true
+          az sql server firewall-rule delete \
+            --resource-group "$AZ_RG" \
+            --server "$AZ_SQL_NAME" \
+            --name "$FW_RULE_NAME" \
+            --yes || true
