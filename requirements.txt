@@ -1,3 +1,8 @@
 pandas
+numpy
 httpx
+aiohttp
+python-dateutil
+sqlalchemy>=2
+pyodbc
 stream-read-xbrl
