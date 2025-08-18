@@ -1,73 +1,57 @@
-name: Ingest Monthly Accounts → yearly_sqlites
+name: Bulk ingest monthly CH accounts → Azure SQL
 
 on:
   workflow_dispatch:
     inputs:
+      YEAR:
+        description: "Year (e.g., 2024) — or leave blank to use range"
+        required: false
+        default: ""
       START:
-        description: "Start month (YYYY-MM), e.g., 2023-01"
-        required: true
-        default: "2023-01"
+        description: "Start (YYYY-MM)"
+        required: false
+        default: ""
       END:
-        description: "End month (YYYY-MM), e.g., 2025-06"
-        required: true
-        default: "2025-06"
+        description: "End (YYYY-MM)"
+        required: false
+        default: ""
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   ingest:
     runs-on: ubuntu-latest
-    timeout-minutes: 360
-    steps:
-      - name: Checkout (with LFS)
-        uses: actions/checkout@v4
-        with:
-          lfs: true
-          fetch-depth: 0   # important for pull/rebase
+    timeout-minutes: 720
+    env:
+      AZURE_SQL_SERVER:   ${{ secrets.AZURE_SQL_SERVER }}
+      AZURE_SQL_DATABASE: ${{ secrets.AZURE_SQL_DATABASE }}
+      AZURE_SQL_USERNAME: ${{ secrets.AZURE_SQL_USERNAME }}
+      AZURE_SQL_PASSWORD: ${{ secrets.AZURE_SQL_PASSWORD }}
+      AZURE_SQL_CONN:     ${{ secrets.AZURE_SQL_CONN }}
 
-      - name: Set up Python
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Python + ODBC
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
           cache: "pip"
 
-      - name: Install deps
+      - name: Install ODBC driver & deps
         run: |
+          sudo su -c 'curl https://packages.microsoft.com/keys/microsoft.asc | apt-key add -'
+          sudo su -c 'curl https://packages.microsoft.com/config/ubuntu/22.04/prod.list > /etc/apt/sources.list.d/mssql-release.list'
+          sudo apt-get update
+          sudo ACCEPT_EULA=Y apt-get install -y msodbcsql18 unixodbc-dev
           python -m pip install --upgrade pip
-          pip install pandas httpx stream-read-xbrl
+          pip install -r requirements.txt
 
-      # Pull before we start so we base work on latest main
-      - name: Pull latest to avoid non-fast-forward (pre-commit)
+      - name: Ingest (choose year or start/end)
         run: |
-          git fetch origin ${{ github.ref_name }}
-          git pull --rebase origin ${{ github.ref_name }} || true
-
-      - name: Run monthly ingest
-        run: |
-          python ingest_monthly_to_sqlite.py --start "${{ github.event.inputs.START }}" --end "${{ github.event.inputs.END }}"
-
-      - name: Git LFS install (runner)
-        run: git lfs install --local
-
-      - name: Ensure LFS tracking for SQLite
-        run: |
-          if [ ! -f .gitattributes ] || ! grep -q '\*\.sqlite filter=lfs diff=lfs merge=lfs -text' .gitattributes; then
-            git lfs track "*.sqlite"
-            echo "Tracked *.sqlite via LFS"
+          if [ -n "${{ github.event.inputs.YEAR }}" ]; then
+            python ingest_monthly_to_sqlite.py --year "${{ github.event.inputs.YEAR }}"
+          else
+            python ingest_monthly_to_sqlite.py --start "${{ github.event.inputs.START }}" --end "${{ github.event.inputs.END }}"
           fi
-          git add .gitattributes
-
-      - name: Stage + commit
-        run: |
-          git add -A
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git commit -m "Ingest monthly CH accounts (${{ github.event.inputs.START }}..${{ github.event.inputs.END }})" || echo "No changes"
-
-      - name: Final rebase, then push (LFS-aware)
-        env:
-          GH_TOKEN: ${{ secrets.GH_TOKEN }}
-        run: |
-          git pull --rebase origin ${{ github.ref_name }} || true
-          git push https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }} HEAD:${{ github.ref_name }}
