@@ -47,7 +47,7 @@ jobs:
           AZURE_SQL_USER:     ${{ secrets.AZURE_SQL_USER }}
           AZURE_SQL_PASSWORD: ${{ secrets.AZURE_SQL_PASSWORD }}
         run: |
-          python sync_latest_ixbrl_to_azure.py
+          python sync_latest_ixbrl.py
 
       - name: Summary
         if: always()
