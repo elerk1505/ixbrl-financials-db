@@ -103,11 +103,17 @@ def distinct_company_numbers_from_financials():
 # ------------------------------
 # Upsert for daily financials
 # ------------------------------
-def upsert_financials_dataframe(df: pd.DataFrame,
-                                target_table: str = "dbo.financials",
-                                key_cols=None):
+def upsert_financials_dataframe(
+    df: pd.DataFrame,
+    target_table: str = "dbo.financials",
+    key_cols=None,
+) -> int:
+    """
+    Loads df to a random staging table, MERGEs into target_table on key_cols,
+    drops the staging table, returns how many staging rows were processed.
+    """
     if df is None or df.empty:
-        return
+        return 0
     if key_cols is None:
         key_cols = ["companies_house_registered_number", "period_end"]
 
@@ -116,18 +122,22 @@ def upsert_financials_dataframe(df: pd.DataFrame,
 
     stage = f"_stg_fin_{uuid.uuid4().hex[:8]}"
     eng = engine()
+
     with eng.begin() as con:
-        # Load into staging table
+        # 1) load to staging
         df.to_sql(stage, con=con, schema="dbo", if_exists="replace",
                   index=False, method="multi", chunksize=1000)
 
+        # 2) compute how many rows we intend to merge (for logging)
+        rowcount = con.execute(text(f"SELECT COUNT(*) FROM dbo.{stage}")).scalar_one()
+
+        # 3) MERGE into final
         cols = list(df.columns)
         on_clause   = " AND ".join([f"t.[{k}] = s.[{k}]" for k in key_cols])
         set_clause  = ", ".join([f"t.[{c}] = s.[{c}]" for c in cols if c not in key_cols])
         insert_cols = ", ".join(f"[{c}]" for c in cols)
         insert_vals = ", ".join(f"s.[{c}]" for c in cols)
 
-        # Merge into permanent table
         con.execute(text(f"""
             MERGE {target_table} AS t
             USING (SELECT * FROM dbo.{stage}) AS s
@@ -135,4 +145,6 @@ def upsert_financials_dataframe(df: pd.DataFrame,
             WHEN MATCHED THEN UPDATE SET {set_clause}
             WHEN NOT MATCHED THEN INSERT ({insert_cols}) VALUES ({insert_vals});
             DROP TABLE dbo.{stage};
-        """)))
+        """))
+
+    return int(rowcount)
