@@ -34,18 +34,30 @@ async def fetch_one(session, api_key:str, company_number:str, timeout:int) -> Di
 def select_targets(since_days: Optional[int], force: bool, max_per_run: Optional[int]) -> List[str]:
     ensure_company_profiles_table()
     all_ids = distinct_company_numbers_from_financials()
+
+    # Guard: nothing to do if financials table is empty
+    if not all_ids:
+        print("⚠️ No company IDs found in dbo.financials; run the financials ingest first.")
+        return []
+
     with engine().begin() as con:
         existing = {r[0] for r in con.execute(text("SELECT company_number FROM dbo.company_profiles"))}
-        stale=set()
+        stale = set()
         if since_days:
-            q=text("SELECT company_number FROM dbo.company_profiles WHERE fetched_at<=DATEADD(day,-:d, SYSUTCDATETIME())")
-            stale={r[0] for r in con.execute(q, {"d":int(since_days)})}
+            q = text(
+                "SELECT company_number FROM dbo.company_profiles "
+                "WHERE fetched_at<=DATEADD(day,-:d, SYSUTCDATETIME())"
+            )
+            stale = {r[0] for r in con.execute(q, {"d": int(since_days)})}
+
     if force:
-        targets=all_ids
+        targets = all_ids
     else:
-        targets=[n for n in all_ids if (n not in existing) or (n in stale)]
+        targets = [n for n in all_ids if (n not in existing) or (n in stale)]
+
     if max_per_run:
-        targets=targets[:int(max_per_run)]
+        targets = targets[:int(max_per_run)]
+
     print(f"IDs total:{len(all_ids):,} existing:{len(existing):,} stale:{len(stale):,} to_fetch:{len(targets):,}")
     return targets
 
