@@ -5,69 +5,50 @@
 Monthly iXBRL -> Azure SQL
 
 Choose months via:
-  A) Explicit range: --start-month YYYY-MM --end-month YYYY-MM   (inclusive)
-  B) Explicit list:  --months 2024-01,2024-02
-  C) Rolling:        --since-months N  (N=1 = current month only)
+  A) Range  : --start-month YYYY-MM --end-month YYYY-MM  (inclusive)
+  B) List   : --months 2024-01,2024-02
+  C) Lookback: --since-months N (N=1 => current month only)
 
-URLs handled:
-  - 2025+                          -> https://download.companieshouse.gov.uk/Accounts_Monthly_Data-MonthYYYY.zip
-  - 2024 Jan..Jun                  -> https://download.companieshouse.gov.uk/Accounts_Monthly_Data-Month2024.zip
-  - 2024 Jul..Dec and 2010..2023   -> https://download.companieshouse.gov.uk/archive/Accounts_Monthly_Data-MonthYYYY.zip
-  - 2009                           -> https://download.companieshouse.gov.uk/archive/Accounts_Monthly_Data-JanuaryToDecember2009.zip
-  - 2008                           -> https://download.companieshouse.gov.uk/archive/Accounts_Monthly_Data-JanuaryToDecember2008.zip
+Writes into the requested table (default dbo.financials). Before writing, the
+DataFrame is aligned to the table's columns to prevent "Invalid column name" errors.
 
-Default target is dbo.financials.
+Also supports the real Monthly ZIP URL patterns:
+  - Live    : https://download.companieshouse.gov.uk/Accounts_Monthly_Data-{Month}{YYYY}.zip
+  - Archive : https://download.companieshouse.gov.uk/archive/Accounts_Monthly_Data-{Month}{YYYY}.zip
+  - Special : https://download.companieshouse.gov.uk/archive/Accounts_Monthly_Data-JanuaryToDecember{YYYY}.zip  (2008, 2009)
+
+Requires: httpx pandas stream-read-xbrl sqlalchemy pyodbc
 """
 
 from __future__ import annotations
-
 import argparse
 import os
-import time
 from datetime import date, datetime, timezone
-from typing import Iterable, List, Optional, Tuple
+from typing import Iterable, List, Optional, Sequence
 
 import httpx
 import pandas as pd
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, inspect
 from sqlalchemy.engine import Engine
-from sqlalchemy.exc import SQLAlchemyError, OperationalError
+from sqlalchemy.exc import SQLAlchemyError
 
-
-# --------------------------
+# -----------------------------
 # SQL helpers
-# --------------------------
+# -----------------------------
+
 def build_engine(*, engine_url: Optional[str], odbc_connect: Optional[str]) -> Engine:
-    """
-    Build SQLAlchemy engine for SQL Server/pyodbc.
-    Accepts either:
-      - engine_url (mssql+pyodbc:///?odbc_connect=URLENCODED)
-      - odbc_connect (raw ODBC connect string; we URL-encode here)
-    """
     if not engine_url and not odbc_connect:
         engine_url = os.getenv("AZURE_SQL_URL")
         odbc_connect = os.getenv("AZURE_SQL_ODBC")
-
     if not engine_url and not odbc_connect:
         raise RuntimeError("Provide --engine-url or --odbc-connect (or set AZURE_SQL_URL/AZURE_SQL_ODBC).")
-
     if not engine_url:
         import urllib.parse
-
-        # ensure a sane connection timeout unless already set
-        if "Connection Timeout=" not in odbc_connect and "Timeout=" not in odbc_connect:
-            if not odbc_connect.endswith(";"):
-                odbc_connect += ";"
-            odbc_connect += "Connection Timeout=60;"
-
         engine_url = "mssql+pyodbc:///?odbc_connect=" + urllib.parse.quote_plus(odbc_connect)
-
     return create_engine(engine_url, fast_executemany=True, future=True)
-
 
 def infer_staging_dtypes(df: pd.DataFrame):
     from sqlalchemy import types as T
-
     d = {}
     for c, t in df.dtypes.items():
         if pd.api.types.is_datetime64_any_dtype(t):
@@ -78,86 +59,53 @@ def infer_staging_dtypes(df: pd.DataFrame):
             d[c] = T.NVARCHAR(length=None)
     return d
 
-
-def to_sql_append_with_retry(
-    df: pd.DataFrame,
-    engine_factory,
-    schema: str,
-    table: str,
-    chunksize: int = 1000,
-    max_attempts: int = 5,
-    sleep_seconds: int = 8,
-) -> int:
-    """
-    Append df into schema.table with retries around transient ODBC 'HYT00' login timeouts.
-    engine_factory: callable returning a fresh Engine (so we can recreate on retry).
-    """
+def to_sql_append(df: pd.DataFrame, engine: Engine, table: str, schema: str = "dbo", chunksize: int = 1000) -> int:
     if df.empty:
         return 0
-
-    # SQL-friendly columns
+    # Make column names SQL-friendly
     df = df.rename(columns={c: c.strip().replace(" ", "_") for c in df.columns})
-    dtypes = infer_staging_dtypes(df)
+    df.to_sql(
+        name=table,
+        con=engine,
+        schema=schema,
+        if_exists="append",
+        index=False,
+        dtype=infer_staging_dtypes(df),
+        chunksize=chunksize,
+        method=None,
+    )
+    return len(df)
 
-    attempt = 0
-    last_err: Optional[BaseException] = None
-    while attempt < max_attempts:
-        attempt += 1
-        try:
-            eng: Engine = engine_factory()
-            with eng.begin() as conn:
-                df.to_sql(
-                    name=table,
-                    con=conn,
-                    schema=schema,
-                    if_exists="append",
-                    index=False,
-                    dtype=dtypes,
-                    chunksize=chunksize,
-                    method=None,
-                )
-            return len(df)
-        except OperationalError as e:
-            # Typical transient: ('HYT00', ... Login timeout expired)
-            last_err = e
-            msg = str(e).lower()
-            print(f"[append attempt {attempt}/{max_attempts}] OperationalError: {e}")
-            if attempt < max_attempts and ("hyt00" in msg or "timeout" in msg or "temporar" in msg):
-                time.sleep(sleep_seconds)
-                continue
-            raise
-        except Exception as e:
-            last_err = e
-            print(f"[append attempt {attempt}/{max_attempts}] Unexpected SQL error: {e}")
-            raise
-    if last_err:
-        raise last_err
-    return 0
+def get_table_columns(engine: Engine, schema: str, table: str) -> List[str]:
+    insp = inspect(engine)
+    cols = [c["name"] for c in insp.get_columns(table, schema=schema)]
+    return cols
 
+def align_df_to_table(df: pd.DataFrame, table_columns: Sequence[str]) -> pd.DataFrame:
+    cols_set = set(table_columns)
 
-# --------------------------
+    # If table uses 'companies_house_registered_number', map DF's 'company_number' into it.
+    if "company_number" in df.columns and "companies_house_registered_number" in cols_set:
+        df = df.rename(columns={"company_number": "companies_house_registered_number"})
+
+    # Strip spaces from company number columns if present
+    for cname in ("companies_house_registered_number", "company_number"):
+        if cname in df.columns:
+            df[cname] = df[cname].astype(str).str.replace(" ", "", regex=False)
+
+    # Keep only columns that actually exist in the table
+    keep = [c for c in df.columns if c in cols_set]
+    filtered = df[keep].copy()
+
+    return filtered
+
+# -----------------------------
 # Month selection helpers
-# --------------------------
-MONTH_NAMES = [
-    "January",
-    "February",
-    "March",
-    "April",
-    "May",
-    "June",
-    "July",
-    "August",
-    "September",
-    "October",
-    "November",
-    "December",
-]
-
+# -----------------------------
 
 def parse_yyyy_mm(s: str) -> date:
     y, m = s.split("-", 1)
     return date(int(y), int(m), 1)
-
 
 def month_iter_inclusive(start_ym: str, end_ym: str) -> Iterable[str]:
     cur = parse_yyyy_mm(start_ym)
@@ -169,10 +117,8 @@ def month_iter_inclusive(start_ym: str, end_ym: str) -> Iterable[str]:
             y, m = y + 1, 1
         cur = date(y, m, 1)
 
-
 def months_from_list(csv: str) -> List[str]:
     return [x.strip() for x in csv.split(",") if x.strip()]
-
 
 def default_since_months(n: int) -> List[str]:
     # current month back N-1 months
@@ -186,88 +132,92 @@ def default_since_months(n: int) -> List[str]:
             y, m = y - 1, 12
     return out
 
+# -----------------------------
+# Download & parse the monthly ZIP
+# -----------------------------
 
-def ym_to_month_name(ym: str) -> Tuple[str, int, int]:
-    """Return (MonthName, year, month) for 'YYYY-MM'."""
-    d = parse_yyyy_mm(ym)
-    return MONTH_NAMES[d.month - 1], d.year, d.month
+def month_name_en(ym: str) -> str:
+    import calendar
+    dt = parse_yyyy_mm(ym)
+    return calendar.month_name[dt.month]  # 'January', 'February', ...
 
+def candidate_urls_for_month(ym: str) -> List[str]:
+    """Return URL candidates from newest to oldest locations."""
+    y = parse_yyyy_mm(ym).year
+    mon = month_name_en(ym)
+    live = f"https://download.companieshouse.gov.uk/Accounts_Monthly_Data-{mon}{y}.zip"
+    archive = f"https://download.companieshouse.gov.uk/archive/Accounts_Monthly_Data-{mon}{y}.zip"
 
-def monthly_zip_url(ym: str) -> str:
-    """
-    Build the correct CH monthly ZIP URL for a given 'YYYY-MM'.
-    Rules per user examples:
-      - 2025+  -> non-archive
-      - 2024   -> Jan–Jun non-archive; Jul–Dec archive
-      - 2010–2023 -> archive
-      - 2009, 2008 -> special 'JanuaryToDecember' archives
-    """
-    month_name, year, month = ym_to_month_name(ym)
+    urls = [live, archive]
 
-    # Special yearly bundles
-    if year == 2009 or year == 2008:
-        return (
-            "https://download.companieshouse.gov.uk/archive/"
-            f"Accounts_Monthly_Data-JanuaryToDecember{year}.zip"
-        )
+    # Special case for 2008/2009 yearly bundles
+    if y in (2008, 2009):
+        urls.append(f"https://download.companieshouse.gov.uk/archive/Accounts_Monthly_Data-JanuaryToDecember{y}.zip")
 
-    base = "https://download.companieshouse.gov.uk"
-    path = f"/Accounts_Monthly_Data-{month_name}{year}.zip"
+    return urls
 
-    # Archive switch
-    use_archive = False
-    if 2010 <= year <= 2023:
-        use_archive = True
-    elif year == 2024 and month >= 7:
-        use_archive = True
-    elif year <= 2007:
-        use_archive = True  # (defensive; unlikely needed)
+def fetch_month_zip_as_df(yyyy_mm: str, timeout: float = 180.0) -> pd.DataFrame:
+    from stream_read_xbrl import stream_read_xbrl_zip
 
-    if use_archive:
-        return f"{base}/archive{path}"
-    else:
-        return f"{base}{path}"
+    last_err: Optional[Exception] = None
+    for url in candidate_urls_for_month(yyyy_mm):
+        print(f"Fetching month: {yyyy_mm} -> {url}")
+        try:
+            with httpx.stream("GET", url, timeout=timeout) as r:
+                r.raise_for_status()
+                with stream_read_xbrl_zip(r.iter_bytes()) as (columns, rows):
+                    data = [[("" if v is None else str(v)) for v in row] for row in rows]
+            return pd.DataFrame(data, columns=columns)
+        except httpx.HTTPStatusError as e:
+            # Try the next candidate on 404; re-raise other HTTP errors
+            if e.response is not None and e.response.status_code == 404:
+                print(f"No monthly file at {url} (404). Trying next candidate…")
+                last_err = e
+                continue
+            raise
+        except Exception as e:
+            last_err = e
+            break
 
+    # If we got here, nothing worked
+    if last_err:
+        raise last_err
+    raise FileNotFoundError(f"No URL worked for {yyyy_mm}")
 
-# --------------------------
-# Fetch + normalise
-# --------------------------
-def fetch_month_zip_as_df(ym: str, timeout: float = 180.0) -> pd.DataFrame:
-    url = monthly_zip_url(ym)
-    print(f"Fetching month: {ym} -> {url}")
-    with httpx.stream("GET", url, timeout=timeout) as r:
-        r.raise_for_status()
-        from stream_read_xbrl import stream_read_xbrl_zip
-
-        with stream_read_xbrl_zip(r.iter_bytes()) as (columns, rows):
-            data = [[("" if v is None else str(v)) for v in row] for row in rows]
-    return pd.DataFrame(data, columns=columns)
-
+# -----------------------------
+# Normalisation
+# -----------------------------
 
 def normalise_columns(df: pd.DataFrame) -> pd.DataFrame:
-    if "companies_house_registered_number" in df.columns and "company_number" not in df.columns:
+    # Create canonical 'company_number' if needed
+    if "company_number" not in df.columns and "companies_house_registered_number" in df.columns:
         df["company_number"] = (
             df["companies_house_registered_number"].astype(str).str.replace(" ", "", regex=False)
         )
+    elif "company_number" in df.columns:
+        df["company_number"] = df["company_number"].astype(str).str.replace(" ", "", regex=False)
+
+    # Canonicalise 'period_end'
     for cand in ("period_end", "balance_sheet_date", "date_end", "yearEnd"):
         if cand in df.columns:
             if cand != "period_end":
                 df = df.rename(columns={cand: "period_end"})
             break
+
     if "period_end" in df.columns:
         df["period_end"] = pd.to_datetime(df["period_end"], errors="coerce").dt.date
+
     return df
 
-
-# --------------------------
+# -----------------------------
 # Main
-# --------------------------
+# -----------------------------
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Ingest MONTHLY iXBRL zips into Azure SQL.")
-    # Range
+    # Range / list / lookback
     ap.add_argument("--start-month", help="YYYY-MM start (inclusive).")
     ap.add_argument("--end-month", help="YYYY-MM end (inclusive).")
-    # List / Lookback
     ap.add_argument("--months", help="Comma-separated YYYY-MM list (e.g. 2024-01,2024-02).")
     ap.add_argument("--since-months", type=int, default=1, help="If no months given, current month back N-1 months.")
     # SQL
@@ -276,10 +226,11 @@ def main() -> int:
     ap.add_argument("--schema", default="dbo")
     ap.add_argument("--target-table", default="financials", help="Final table (default: financials)")
     ap.add_argument("--timeout", type=float, default=180.0)
+    ap.add_argument("--append-retries", type=int, default=5, help="Retries for SQL append on transient errors.")
 
     args = ap.parse_args()
 
-    # Decide month set
+    # Build month list
     if args.start_month and args.end_month:
         months = list(month_iter_inclusive(args.start_month, args.end_month))
     elif args.months:
@@ -289,29 +240,31 @@ def main() -> int:
 
     print(f"Target months: {months}")
 
-    # Engine factory so we can recreate between retries
-    def engine_factory() -> Engine:
-        return build_engine(engine_url=args.engine_url, odbc_connect=args.odbc_connect)
-
-    # Smoke-test engine once up front (prints clearer error early)
+    # Engine
     try:
-        eng = engine_factory()
-        with eng.connect() as conn:
-            conn.exec_driver_sql("SELECT 1")
+        engine = build_engine(engine_url=args.engine_url, odbc_connect=args.odbc_connect)
     except Exception as e:
-        print(f"ERROR building/connecting engine: {e}")
+        print(f"ERROR building engine: {e}")
+        return 1
+
+    # Determine target table columns once
+    try:
+        target_cols = get_table_columns(engine, args.schema, args.target_table)
+        if not target_cols:
+            print(f"ERROR: target table {args.schema}.{args.target_table} not found or has no columns.")
+            return 1
+        print(f"Detected {args.schema}.{args.target_table} columns: {len(target_cols)}")
+    except Exception as e:
+        print(f"ERROR inspecting {args.schema}.{args.target_table}: {e}")
         return 1
 
     wrote_any = False
 
     for ym in months:
-        # 1) Fetch + parse
+        # 1) Fetch & parse
         try:
             df = fetch_month_zip_as_df(ym, timeout=args.timeout)
         except httpx.HTTPStatusError as e:
-            if e.response.status_code == 404:
-                print(f"No monthly file for {ym} (404). Skipping.")
-                continue
             print(f"HTTP error for {ym}: {e}")
             return 1
         except Exception as e:
@@ -325,26 +278,34 @@ def main() -> int:
         # 2) Normalise
         df = normalise_columns(df)
 
-        # 3) Append (with transient timeout retries)
-        try:
-            rows = to_sql_append_with_retry(
-                df=df,
-                engine_factory=engine_factory,
-                schema=args.schema,
-                table=args.target_table,
-                chunksize=1000,
-                max_attempts=5,
-                sleep_seconds=8,
-            )
-        except SQLAlchemyError as e:
-            print(f"SQL error for {ym} into {args.schema}.{args.target_table}: {e}")
-            return 1
-        except Exception as e:
-            print(f"Unexpected SQL error for {ym}: {e}")
-            return 1
+        # 3) Align to target table columns
+        df_aligned = align_df_to_table(df, target_cols)
+        if df_aligned.empty:
+            print(f"{ym}: no overlapping columns with {args.schema}.{args.target_table}. Skipping.")
+            continue
 
-        print(f"✅ {ym}: appended {rows} rows into {args.schema}.{args.target_table}.")
-        wrote_any = True
+        # 4) Append with retries (handles intermittent SQL connectivity)
+        last_err: Optional[Exception] = None
+        for attempt in range(1, args.append_retries + 1):
+            try:
+                rows = to_sql_append(df_aligned, engine, table=args.target_table, schema=args.schema, chunksize=1000)
+                print(f"✅ {ym}: appended {rows} rows into {args.schema}.{args.target_table}.")
+                wrote_any = True
+                last_err = None
+                break
+            except SQLAlchemyError as e:
+                last_err = e
+                print(f"[append attempt {attempt}/{args.append_retries}] OperationalError: {e}")
+            except Exception as e:
+                last_err = e
+                print(f"[append attempt {attempt}/{args.append_retries}] Unexpected SQL error: {e}")
+            # brief backoff
+            import time
+            time.sleep(5)
+
+        if last_err:
+            print(f"SQL error for {ym} into {args.schema}.{args.target_table}: {last_err}")
+            return 1
 
     if not wrote_any:
         print("Nothing ingested (no files or all empty).")
