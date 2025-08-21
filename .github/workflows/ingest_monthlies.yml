@@ -102,25 +102,27 @@ jobs:
         shell: bash
         run: |
           python - <<'PY'
-          import os, time, pyodbc, sys
-          cs = ("Driver=ODBC Driver 18 for SQL Server;"
-                f"Server=tcp:{os.getenv('AZURE_SQL_SERVER')},1433;"
-                f"Database={os.getenv('AZURE_SQL_DATABASE')};"
-                f"Uid={os.getenv('AZURE_SQL_USERNAME')};"
-                f"Pwd={os.getenv('AZURE_SQL_PASSWORD')};"
-                "Encrypt=yes;TrustServerCertificate=no;Connection Timeout=30;")
+          import os, pyodbc, time
+
+          cs = os.getenv("AZURE_SQL_ODBC")
+          if not cs:
+              raise RuntimeError("AZURE_SQL_ODBC not set")
+
           last_err = None
           for attempt in range(1, 6):
               try:
-                  with pyodbc.connect(cs) as c:
-                      cur=c.cursor(); cur.execute("SELECT 1")
-                      print("Connectivity OK: SELECT 1 ->", cur.fetchone()[0])
-                      sys.exit(0)
+                  print(f"Attempt {attempt}/5 connecting…")
+                  with pyodbc.connect(cs, timeout=60) as c:
+                      cur = c.cursor()
+                      cur.execute("SELECT 1")
+                      print("✅ Connectivity OK: SELECT 1 ->", cur.fetchone()[0])
+                      raise SystemExit(0)
               except Exception as e:
                   last_err = e
-                  print(f"[attempt {attempt}/5] connect failed: {e}")
+                  print(f"⚠️ attempt {attempt}/5 failed: {e}")
                   time.sleep(5)
-          print("ERROR: could not connect after retries.")
+
+          print("❌ ERROR: could not connect after retries:", last_err)
           raise SystemExit(1)
           PY
 
