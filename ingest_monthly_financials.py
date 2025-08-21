@@ -5,14 +5,14 @@
 Monthly iXBRL -> Azure SQL
 
 Choose months via:
-  A) Range  : --start-month YYYY-MM --end-month YYYY-MM  (inclusive)
-  B) List   : --months 2024-01,2024-02
+  A) Range   : --start-month YYYY-MM --end-month YYYY-MM  (inclusive)
+  B) List    : --months 2024-01,2024-02
   C) Lookback: --since-months N (N=1 => current month only)
 
 Writes into the requested table (default dbo.financials). Before writing, the
 DataFrame is aligned to the table's columns to prevent "Invalid column name" errors.
 
-Also supports the real Monthly ZIP URL patterns:
+Monthly ZIP URL patterns:
   - Live    : https://download.companieshouse.gov.uk/Accounts_Monthly_Data-{Month}{YYYY}.zip
   - Archive : https://download.companieshouse.gov.uk/archive/Accounts_Monthly_Data-{Month}{YYYY}.zip
   - Special : https://download.companieshouse.gov.uk/archive/Accounts_Monthly_Data-JanuaryToDecember{YYYY}.zip  (2008, 2009)
@@ -32,6 +32,32 @@ from sqlalchemy import create_engine, inspect
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import SQLAlchemyError
 
+
+# -----------------------------
+# Utilities
+# -----------------------------
+
+def dedupe_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Drop duplicate-named columns, keeping the first occurrence.
+    This prevents df['col'] from returning a DataFrame when headers repeat.
+    """
+    if df.columns.duplicated().any():
+        df = df.loc[:, ~df.columns.duplicated()].copy()
+    return df
+
+
+def series_or_first(df: pd.DataFrame, name: str) -> pd.Series:
+    """
+    Return a Series for column `name` even if duplicates exist.
+    If duplicates exist and df[name] is a DataFrame, take the first column.
+    """
+    obj = df[name]
+    if isinstance(obj, pd.DataFrame):
+        return obj.iloc[:, 0]
+    return obj
+
+
 # -----------------------------
 # SQL helpers
 # -----------------------------
@@ -47,6 +73,7 @@ def build_engine(*, engine_url: Optional[str], odbc_connect: Optional[str]) -> E
         engine_url = "mssql+pyodbc:///?odbc_connect=" + urllib.parse.quote_plus(odbc_connect)
     return create_engine(engine_url, fast_executemany=True, future=True)
 
+
 def infer_staging_dtypes(df: pd.DataFrame):
     from sqlalchemy import types as T
     d = {}
@@ -59,10 +86,10 @@ def infer_staging_dtypes(df: pd.DataFrame):
             d[c] = T.NVARCHAR(length=None)
     return d
 
+
 def to_sql_append(df: pd.DataFrame, engine: Engine, table: str, schema: str = "dbo", chunksize: int = 1000) -> int:
     if df.empty:
         return 0
-    # Make column names SQL-friendly
     df = df.rename(columns={c: c.strip().replace(" ", "_") for c in df.columns})
     df.to_sql(
         name=table,
@@ -76,28 +103,37 @@ def to_sql_append(df: pd.DataFrame, engine: Engine, table: str, schema: str = "d
     )
     return len(df)
 
+
 def get_table_columns(engine: Engine, schema: str, table: str) -> List[str]:
     insp = inspect(engine)
     cols = [c["name"] for c in insp.get_columns(table, schema=schema)]
     return cols
 
+
 def align_df_to_table(df: pd.DataFrame, table_columns: Sequence[str]) -> pd.DataFrame:
+    """
+    - Deduplicate incoming columns
+    - Map company_number -> companies_house_registered_number when needed
+    - Clean company number strings (strip spaces)
+    - Keep only columns that exist in the target table
+    """
+    df = dedupe_columns(df)
     cols_set = set(table_columns)
 
-    # If table uses 'companies_house_registered_number', map DF's 'company_number' into it.
+    # Map company_number to the column your table actually has
     if "company_number" in df.columns and "companies_house_registered_number" in cols_set:
         df = df.rename(columns={"company_number": "companies_house_registered_number"})
 
-    # Strip spaces from company number columns if present
+    # Clean company number strings if present
     for cname in ("companies_house_registered_number", "company_number"):
         if cname in df.columns:
-            df[cname] = df[cname].astype(str).str.replace(" ", "", regex=False)
+            s = series_or_first(df, cname)
+            df[cname] = s.astype(str).str.replace(" ", "", regex=False)
 
-    # Keep only columns that actually exist in the table
+    # Keep only columns that exist in the table
     keep = [c for c in df.columns if c in cols_set]
-    filtered = df[keep].copy()
+    return df[keep].copy()
 
-    return filtered
 
 # -----------------------------
 # Month selection helpers
@@ -106,6 +142,7 @@ def align_df_to_table(df: pd.DataFrame, table_columns: Sequence[str]) -> pd.Data
 def parse_yyyy_mm(s: str) -> date:
     y, m = s.split("-", 1)
     return date(int(y), int(m), 1)
+
 
 def month_iter_inclusive(start_ym: str, end_ym: str) -> Iterable[str]:
     cur = parse_yyyy_mm(start_ym)
@@ -117,8 +154,10 @@ def month_iter_inclusive(start_ym: str, end_ym: str) -> Iterable[str]:
             y, m = y + 1, 1
         cur = date(y, m, 1)
 
+
 def months_from_list(csv: str) -> List[str]:
     return [x.strip() for x in csv.split(",") if x.strip()]
+
 
 def default_since_months(n: int) -> List[str]:
     # current month back N-1 months
@@ -132,6 +171,7 @@ def default_since_months(n: int) -> List[str]:
             y, m = y - 1, 12
     return out
 
+
 # -----------------------------
 # Download & parse the monthly ZIP
 # -----------------------------
@@ -140,6 +180,7 @@ def month_name_en(ym: str) -> str:
     import calendar
     dt = parse_yyyy_mm(ym)
     return calendar.month_name[dt.month]  # 'January', 'February', ...
+
 
 def candidate_urls_for_month(ym: str) -> List[str]:
     """Return URL candidates from newest to oldest locations."""
@@ -156,6 +197,7 @@ def candidate_urls_for_month(ym: str) -> List[str]:
 
     return urls
 
+
 def fetch_month_zip_as_df(yyyy_mm: str, timeout: float = 180.0) -> pd.DataFrame:
     from stream_read_xbrl import stream_read_xbrl_zip
 
@@ -167,9 +209,8 @@ def fetch_month_zip_as_df(yyyy_mm: str, timeout: float = 180.0) -> pd.DataFrame:
                 r.raise_for_status()
                 with stream_read_xbrl_zip(r.iter_bytes()) as (columns, rows):
                     data = [[("" if v is None else str(v)) for v in row] for row in rows]
-            return pd.DataFrame(data, columns=columns)
+            return dedupe_columns(pd.DataFrame(data, columns=columns))
         except httpx.HTTPStatusError as e:
-            # Try the next candidate on 404; re-raise other HTTP errors
             if e.response is not None and e.response.status_code == 404:
                 print(f"No monthly file at {url} (404). Trying next candidate…")
                 last_err = e
@@ -179,23 +220,22 @@ def fetch_month_zip_as_df(yyyy_mm: str, timeout: float = 180.0) -> pd.DataFrame:
             last_err = e
             break
 
-    # If we got here, nothing worked
     if last_err:
         raise last_err
     raise FileNotFoundError(f"No URL worked for {yyyy_mm}")
+
 
 # -----------------------------
 # Normalisation
 # -----------------------------
 
 def normalise_columns(df: pd.DataFrame) -> pd.DataFrame:
-    # Ensure we always have a canonical company_number column
+    df = dedupe_columns(df)
+
+    # Canonical company_number (from CH registered number)
     if "companies_house_registered_number" in df.columns:
-        df["company_number"] = (
-            df["companies_house_registered_number"]
-            .astype(str)   # convert to string
-            .str.replace(" ", "", regex=False)   # strip spaces
-        )
+        s = series_or_first(df, "companies_house_registered_number")
+        df["company_number"] = s.astype(str).str.replace(" ", "", regex=False)
 
     # Canonicalise 'period_end'
     for cand in ("period_end", "balance_sheet_date", "date_end", "yearEnd"):
@@ -205,9 +245,11 @@ def normalise_columns(df: pd.DataFrame) -> pd.DataFrame:
             break
 
     if "period_end" in df.columns:
-        df["period_end"] = pd.to_datetime(df["period_end"], errors="coerce").dt.date
+        s = series_or_first(df, "period_end")
+        df["period_end"] = pd.to_datetime(s, errors="coerce").dt.date
 
     return df
+
 
 # -----------------------------
 # Main
@@ -299,7 +341,6 @@ def main() -> int:
             except Exception as e:
                 last_err = e
                 print(f"[append attempt {attempt}/{args.append_retries}] Unexpected SQL error: {e}")
-            # brief backoff
             import time
             time.sleep(5)
 
