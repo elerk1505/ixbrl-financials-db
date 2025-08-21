@@ -34,13 +34,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 240
     env:
-      # DB creds
       AZURE_SQL_SERVER:   ${{ secrets.AZURE_SQL_SERVER }}
       AZURE_SQL_DATABASE: ${{ secrets.AZURE_SQL_DATABASE }}
       AZURE_SQL_USERNAME: ${{ secrets.AZURE_SQL_USERNAME }}
       AZURE_SQL_PASSWORD: ${{ secrets.AZURE_SQL_PASSWORD }}
       AZURE_SQL_ODBC:     ${{ secrets.AZURE_SQL_ODBC }}
-      # Azure CLI (firewall)
       AZ_SUBSCRIPTION:    ${{ secrets.AZURE_SUBSCRIPTION_ID }}
       AZ_RG:              ${{ secrets.AZURE_RESOURCE_GROUP }}
       AZ_SQL_NAME:        ${{ secrets.AZURE_SQL_SERVER_NAME }}
@@ -77,14 +75,35 @@ jobs:
             --start-ip-address "$RUNNER_IP" \
             --end-ip-address "$RUNNER_IP"
           echo "FW_RULE_NAME=$RULE_NAME" >> "$GITHUB_ENV"
-          # give the firewall a moment to propagate
-          sleep 8
 
       - name: Install system deps (ODBC)
+        shell: bash
         run: |
-          # Use the Ubuntu 24.04 (noble) repo for msodbcsql18
-          sudo su -c 'curl https://packages.microsoft.com/keys/microsoft.asc | apt-key add -'
-          echo "deb [arch=amd64,arm64] https://packages.microsoft.com/ubuntu/24.04/prod noble main" | sudo tee /etc/apt/sources.list.d/mssql-release.list
+          set -euo pipefail
+          # Clean any previous Microsoft list/key that might conflict
+          sudo rm -f /etc/apt/sources.list.d/mssql-release.list \
+                     /etc/apt/sources.list.d/microsoft-prod.list || true
+          sudo rm -f /usr/share/keyrings/microsoft-prod.gpg || true
+
+          # Base deps
+          sudo apt-get update
+          sudo apt-get install -y curl ca-certificates gnupg apt-transport-https
+
+          # Detect Ubuntu codename and version path required by Microsoft repos
+          CODENAME="$(. /etc/os-release && echo "$VERSION_CODENAME")"
+          case "$CODENAME" in
+            noble) MSVER="24.04" ;;
+            jammy) MSVER="22.04" ;;
+            *)     MSVER="24.04" ;;  # default safe bet for latest runners
+          esac
+
+          # Add Microsoft key (keyrings, no apt-key) and repo
+          curl -fsSL https://packages.microsoft.com/keys/microsoft.asc \
+            | gpg --dearmor | sudo tee /usr/share/keyrings/microsoft-prod.gpg >/dev/null
+
+          echo "deb [arch=amd64,arm64 signed-by=/usr/share/keyrings/microsoft-prod.gpg] https://packages.microsoft.com/ubuntu/${MSVER}/prod ${CODENAME} main" \
+            | sudo tee /etc/apt/sources.list.d/microsoft-prod.list >/dev/null
+
           sudo apt-get update
           sudo ACCEPT_EULA=Y apt-get install -y msodbcsql18 unixodbc-dev
 
@@ -93,41 +112,19 @@ jobs:
           python -m pip install --upgrade pip
           pip install httpx pandas stream-read-xbrl sqlalchemy pyodbc
 
-      - name: Connectivity check (with retries)
+      - name: Connectivity check (optional)
         shell: bash
         run: |
-          set -euo pipefail
           python - <<'PY'
-          import os, time, urllib.parse, pyodbc
-
-          # Prefer a full ODBC string if provided
-          odbc = os.getenv("AZURE_SQL_ODBC")
-          if not odbc:
-            server   = os.getenv("AZURE_SQL_SERVER")
-            db       = os.getenv("AZURE_SQL_DATABASE")
-            user     = os.getenv("AZURE_SQL_USERNAME")
-            pwd      = os.getenv("AZURE_SQL_PASSWORD")
-            odbc = (
-              f"Driver=ODBC Driver 18 for SQL Server;"
-              f"Server=tcp:{server},1433;"
-              f"Database={db};Uid={user};Pwd={pwd};"
-              "Encrypt=yes;TrustServerCertificate=no;Connection Timeout=30;"
-            )
-
-          tries = 6
-          for i in range(1, tries+1):
-            try:
-              with pyodbc.connect(odbc) as c:
-                cur = c.cursor()
-                cur.execute("SELECT 1")
-                print("Connectivity OK ->", cur.fetchone()[0])
-                break
-            except Exception as e:
-              if i == tries:
-                raise
-              backoff = 2 ** i
-              print(f"Connect attempt {i} failed: {e}. Retrying in {backoff}s...")
-              time.sleep(backoff)
+          import os, pyodbc
+          cs = ("Driver=ODBC Driver 18 for SQL Server;"
+                f"Server=tcp:{os.getenv('AZURE_SQL_SERVER')},1433;"
+                f"Database={os.getenv('AZURE_SQL_DATABASE')};"
+                f"Uid={os.getenv('AZURE_SQL_USERNAME')};"
+                f"Pwd={os.getenv('AZURE_SQL_PASSWORD')};"
+                "Encrypt=yes;TrustServerCertificate=no;Connection Timeout=60;")
+          with pyodbc.connect(cs) as c:
+              cur=c.cursor(); cur.execute("SELECT 1"); print("SELECT 1 ->", cur.fetchone()[0])
           PY
 
       - name: Run monthly ingest (range/list/lookback)
@@ -135,8 +132,6 @@ jobs:
         run: |
           set -euo pipefail
           ARGS=()
-
-          # choose date mode
           if [[ -n "${{ inputs.start_month }}" && -n "${{ inputs.end_month }}" ]]; then
             ARGS+=( --start-month "${{ inputs.start_month }}" --end-month "${{ inputs.end_month }}" )
           elif [[ -n "${{ inputs.months }}" ]]; then
@@ -144,15 +139,10 @@ jobs:
           else
             ARGS+=( --since-months "${{ inputs.since_months }}" )
           fi
-
-          # connection: prefer ODBC secret
           if [[ -n "${AZURE_SQL_ODBC:-}" ]]; then
             ARGS+=( --odbc-connect "${AZURE_SQL_ODBC}" )
           fi
-
-          # write directly to dbo.financials
           ARGS+=( --schema dbo --target-table financials )
-
           echo "python ingest_monthly_financials.py ${ARGS[*]}"
           python ingest_monthly_financials.py "${ARGS[@]}"
 
