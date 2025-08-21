@@ -3,14 +3,23 @@ name: Monthly iXBRL Financials Ingest → Azure SQL
 on:
   workflow_dispatch:
     inputs:
-      MONTHS:
-        description: 'Comma-separated YYYY-MM list (e.g. 2024-01,2024-02). Leave blank to use SINCE_MONTHS.'
+      start_month:
+        description: "Start month (YYYY-MM), inclusive. Example: 2023-01"
         required: false
-        default: ''
-      SINCE_MONTHS:
-        description: 'If MONTHS is blank: ingest current month back N-1 months (default 1).'
+        type: string
+      end_month:
+        description: "End month (YYYY-MM), inclusive. Example: 2023-06"
         required: false
-        default: '1'
+        type: string
+      months:
+        description: "Comma-separated list of YYYY-MM (e.g. 2024-01,2024-02). Overrides since_months when set."
+        required: false
+        type: string
+      since_months:
+        description: "If no start/end and no months are given: ingest current month back N-1 months (default 1)."
+        required: false
+        default: "1"
+        type: string
 
 permissions:
   id-token: write
@@ -23,23 +32,18 @@ concurrency:
 jobs:
   ingest-monthlies:
     runs-on: ubuntu-latest
-    timeout-minutes: 720
+    timeout-minutes: 240
     env:
-      # Python expects these:
+      # DB creds from secrets
       AZURE_SQL_SERVER:   ${{ secrets.AZURE_SQL_SERVER }}
       AZURE_SQL_DATABASE: ${{ secrets.AZURE_SQL_DATABASE }}
       AZURE_SQL_USERNAME: ${{ secrets.AZURE_SQL_USERNAME }}
       AZURE_SQL_PASSWORD: ${{ secrets.AZURE_SQL_PASSWORD }}
       AZURE_SQL_ODBC:     ${{ secrets.AZURE_SQL_ODBC }}
-
-      # For the script's month selection
-      MONTHS:        ${{ github.event.inputs.MONTHS }}
-      SINCE_MONTHS:  ${{ github.event.inputs.SINCE_MONTHS }}
-
-      # Azure CLI (for firewall open/close)
-      AZ_SUBSCRIPTION: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
-      AZ_RG:           ${{ secrets.AZURE_RESOURCE_GROUP }}
-      AZ_SQL_NAME:     ${{ secrets.AZURE_SQL_SERVER_NAME }}
+      # Azure CLI (firewall)
+      AZ_SUBSCRIPTION:    ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      AZ_RG:              ${{ secrets.AZURE_RESOURCE_GROUP }}
+      AZ_SQL_NAME:        ${{ secrets.AZURE_SQL_SERVER_NAME }}
 
     steps:
       - name: Checkout
@@ -51,7 +55,6 @@ jobs:
           python-version: "3.11"
           cache: "pip"
 
-      # OIDC login
       - name: Azure Login (OIDC)
         uses: azure/login@v2
         with:
@@ -59,7 +62,6 @@ jobs:
           tenant-id:       ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
-      # Open firewall to runner IP
       - name: Allow runner IP in Azure SQL firewall
         shell: bash
         run: |
@@ -99,19 +101,36 @@ jobs:
                 f"Uid={os.getenv('AZURE_SQL_USERNAME')};"
                 f"Pwd={os.getenv('AZURE_SQL_PASSWORD')};"
                 "Encrypt=yes;TrustServerCertificate=no;Connection Timeout=60;")
-          print("Attempting test connection…")
           with pyodbc.connect(cs) as c:
               cur=c.cursor(); cur.execute("SELECT 1"); print("SELECT 1 ->", cur.fetchone()[0])
-          print("Connectivity OK")
           PY
 
-      - name: Run monthly ingest
+      - name: Run monthly ingest (range/list/lookback)
+        shell: bash
         run: |
-          python scripts/ingest_monthly_financials.py \
-            --months "${MONTHS}" \
-            --since-months "${SINCE_MONTHS}"
+          set -euo pipefail
+          ARGS=()
 
-      # Always close firewall rule
+          # Prefer explicit range when both provided
+          if [[ -n "${{ inputs.start_month }}" && -n "${{ inputs.end_month }}" ]]; then
+            ARGS+=( --start-month "${{ inputs.start_month }}" --end-month "${{ inputs.end_month }}" )
+          elif [[ -n "${{ inputs.months }}" ]]; then
+            ARGS+=( --months "${{ inputs.months }}" )
+          else
+            ARGS+=( --since-months "${{ inputs.since_months }}" )
+          fi
+
+          # Use ODBC secret if provided (engine URL not required)
+          if [[ -n "${AZURE_SQL_ODBC:-}" ]]; then
+            ARGS+=( --odbc-connect "${AZURE_SQL_ODBC}" )
+          fi
+
+          # Write straight into dbo.financials
+          ARGS+=( --schema dbo --target-table financials )
+
+          echo "python ingest_monthly_financials.py ${ARGS[*]}"
+          python ingest_monthly_financials.py "${ARGS[@]}"
+
       - name: Remove runner IP from firewall
         if: always()
         shell: bash
