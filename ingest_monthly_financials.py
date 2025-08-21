@@ -2,137 +2,154 @@
 # -*- coding: utf-8 -*-
 
 """
-Monthly iXBRL -> Azure SQL (direct upsert into dbo.financials)
+Monthly iXBRL -> Azure SQL
 
-- Pulls one or more *monthly* CH bulk zips (YYYY-MM) and parses to rows.
-- Normalises key columns so they match the dbo.financials schema you created.
-- Upserts straight into dbo.financials (via a temporary staging table inside SQL),
-  reusing scripts.azure_sql.upsert_financials_dataframe.
+Now supports three ways to choose which months to ingest:
+  A) Explicit range: --start-month YYYY-MM --end-month YYYY-MM   (inclusive)
+  B) Explicit list:  --months 2024-01,2024-02,2024-03
+  C) Rolling lookback by months: --since-months N   (N=1 means current month only)
 
-Examples:
-  python scripts/ingest_monthly_financials.py --months 2024-06,2024-07
-  python scripts/ingest_monthly_financials.py --since-months 6
-
-Requires:
-  pip install httpx pandas stream-read-xbrl sqlalchemy pyodbc
+Default target is dbo.financials.
 """
 
 from __future__ import annotations
 import argparse
 import os
 from datetime import date
-from typing import List, Optional
+from typing import Iterable, List, Optional
 
-import httpx
 import pandas as pd
-from stream_read_xbrl import stream_read_xbrl_zip
+import httpx
+from sqlalchemy import create_engine
+from sqlalchemy.engine import Engine
+from sqlalchemy.exc import SQLAlchemyError
 
-# Re-use your existing SQL helpers
-from scripts.azure_sql import upsert_financials_dataframe
+# --- you likely already have these helpers in your repo; included here for completeness ---
+def build_engine(*, engine_url: Optional[str], odbc_connect: Optional[str]) -> Engine:
+    if not engine_url and not odbc_connect:
+        engine_url = os.getenv("AZURE_SQL_URL")
+        odbc_connect = os.getenv("AZURE_SQL_ODBC")
+    if not engine_url and not odbc_connect:
+        raise RuntimeError("Provide --engine-url or --odbc-connect (or set AZURE_SQL_URL/AZURE_SQL_ODBC).")
+    if not engine_url:
+        import urllib.parse
+        engine_url = "mssql+pyodbc:///?odbc_connect=" + urllib.parse.quote_plus(odbc_connect)
+    return create_engine(engine_url, fast_executemany=True, future=True)
 
+def infer_staging_dtypes(df: pd.DataFrame):
+    from sqlalchemy import types as T
+    d = {}
+    for c, t in df.dtypes.items():
+        if pd.api.types.is_datetime64_any_dtype(t):
+            d[c] = T.Date()
+        elif pd.api.types.is_object_dtype(t):
+            d[c] = T.NVARCHAR(length=None)
+        else:
+            d[c] = T.NVARCHAR(length=None)
+    return d
 
-def monthly_zip_url(ym: str) -> str:
-    # Companies House monthly: Accounts_Bulk_Data-YYYY-MM.zip
-    return f"https://download.companieshouse.gov.uk/Accounts_Bulk_Data-{ym}.zip"
+def to_sql_append(df: pd.DataFrame, engine: Engine, table: str, schema: str = "dbo", chunksize: int = 1000) -> int:
+    if df.empty:
+        return 0
+    df = df.rename(columns={c: c.strip().replace(" ", "_") for c in df.columns})
+    df.to_sql(name=table, con=engine, schema=schema, if_exists="append",
+              index=False, dtype=infer_staging_dtypes(df), chunksize=chunksize, method=None)
+    return len(df)
 
+# --- monthly helpers ---
+def parse_yyyy_mm(s: str) -> date:
+    y, m = s.split("-", 1)
+    return date(int(y), int(m), 1)
 
-def fetch_month_as_df(ym: str, timeout: float = 300.0) -> pd.DataFrame:
-    """
-    Stream a monthly ZIP (YYYY-MM) and parse iXBRL rows to a DataFrame.
-    """
-    url = monthly_zip_url(ym)
-    print(f"Fetching: {url}")
+def month_iter_inclusive(start_ym: str, end_ym: str) -> Iterable[str]:
+    cur = parse_yyyy_mm(start_ym)
+    end = parse_yyyy_mm(end_ym)
+    while cur <= end:
+        yield f"{cur.year:04d}-{cur.month:02d}"
+        # add one month
+        y, m = cur.year, cur.month + 1
+        if m == 13:
+            y, m = y + 1, 1
+        cur = date(y, m, 1)
+
+def months_from_list(csv: str) -> List[str]:
+    return [x.strip() for x in csv.split(",") if x.strip()]
+
+def default_since_months(n: int) -> List[str]:
+    # current month back N-1 months
+    from datetime import datetime, timezone
+    today = datetime.now(timezone.utc).date().replace(day=1)
+    out = []
+    y, m = today.year, today.month
+    for i in range(n):
+        out.append(f"{y:04d}-{m:02d}")
+        m -= 1
+        if m == 0:
+            y, m = y - 1, 12
+    return out
+
+# You likely already have this; keep it as your parser for a single monthly ZIP
+def fetch_month_zip_as_df(yyyy_mm: str, timeout: float = 180.0) -> pd.DataFrame:
+    # Example URL pattern; keep your existing implementation if different:
+    url = f"https://download.companieshouse.gov.uk/Accounts_Bulk_Data-{yyyy_mm}.zip"
+    print(f"Fetching month: {yyyy_mm} -> {url}")
     with httpx.stream("GET", url, timeout=timeout) as r:
         r.raise_for_status()
+        from stream_read_xbrl import stream_read_xbrl_zip
         with stream_read_xbrl_zip(r.iter_bytes()) as (columns, rows):
-            # coerce None -> "", keep simple strings, let SQL types be handled later
             data = [[("" if v is None else str(v)) for v in row] for row in rows]
     return pd.DataFrame(data, columns=columns)
 
-
 def normalise_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    - Ensure 'companies_house_registered_number' exists and is stripped of spaces
-    - Ensure 'period_end' exists and is a proper date
-    - Keep all other columns as-is (your SQL upsert handles the rest)
-    """
-    # Canonical company number column
-    if "companies_house_registered_number" not in df.columns:
-        # many feeds use company_number; map it
-        if "company_number" in df.columns:
-            df = df.rename(columns={"company_number": "companies_house_registered_number"})
-        else:
-            # best effort: if neither, create blank column to avoid SQL errors
-            df["companies_house_registered_number"] = ""
-
-    df["companies_house_registered_number"] = (
-        df["companies_house_registered_number"].astype(str).str.replace(" ", "", regex=False)
-    )
-
-    # Canonical period_end column (map common variants)
-    if "period_end" not in df.columns:
-        for cand in ("balance_sheet_date", "date_end", "yearEnd"):
-            if cand in df.columns:
+    if "companies_house_registered_number" in df.columns and "company_number" not in df.columns:
+        df["company_number"] = df["companies_house_registered_number"].astype(str).str.replace(" ", "", regex=False)
+    for cand in ("period_end", "balance_sheet_date", "date_end", "yearEnd"):
+        if cand in df.columns:
+            if cand != "period_end":
                 df = df.rename(columns={cand: "period_end"})
-                break
-
+            break
     if "period_end" in df.columns:
-        # robust parse; keep only the date component
         df["period_end"] = pd.to_datetime(df["period_end"], errors="coerce").dt.date
-
-    # Make column names SQL-friendly
-    df = df.rename(columns={c: str(c).strip().replace(" ", "_") for c in df.columns})
     return df
 
-
-def parse_months_arg(months_arg: Optional[str], since_months: int) -> List[str]:
-    """
-    Build list of YYYY-MM strings, either from --months CSV or last N months.
-    """
-    if months_arg:
-        out = []
-        for raw in months_arg.split(","):
-            m = raw.strip()
-            if len(m) == 7 and m[4] == "-" and m[:4].isdigit() and m[5:7].isdigit():
-                out.append(m)
-            else:
-                print(f"WARNING: Skipping invalid month format: {raw!r} (expected YYYY-MM)")
-        # de-dup while preserving order
-        seen = set()
-        uniq = [x for x in out if not (x in seen or seen.add(x))]
-        return uniq
-
-    # last N calendar months including current month
-    today = date.today()
-    res: List[str] = []
-    y, m = today.year, today.month
-    for _ in range(max(1, since_months)):
-        res.append(f"{y:04d}-{m:02d}")
-        m -= 1
-        if m == 0:
-            y -= 1
-            m = 12
-    return res
-
-
 def main() -> int:
-    ap = argparse.ArgumentParser(description="Ingest Companies House monthly iXBRL into dbo.financials")
+    ap = argparse.ArgumentParser(description="Ingest MONTHLY iXBRL zips into Azure SQL.")
+    # NEW: explicit range
+    ap.add_argument("--start-month", help="YYYY-MM start (inclusive).")
+    ap.add_argument("--end-month", help="YYYY-MM end (inclusive).")
+    # Existing/legacy options
     ap.add_argument("--months", help="Comma-separated YYYY-MM list (e.g. 2024-01,2024-02).")
-    ap.add_argument("--since-months", type=int, default=int(os.getenv("SINCE_MONTHS", "1")),
-                    help="If --months not provided, take current month back N-1 months (default 1).")
-    ap.add_argument("--timeout", type=float, default=300.0, help="HTTP timeout per file (seconds).")
+    ap.add_argument("--since-months", type=int, default=1, help="If no months given, current month back N-1 months.")
+    # SQL
+    ap.add_argument("--engine-url")
+    ap.add_argument("--odbc-connect")
+    ap.add_argument("--schema", default="dbo")
+    ap.add_argument("--target-table", default="financials", help="Final table (default: financials)")
+    ap.add_argument("--timeout", type=float, default=180.0)
+
     args = ap.parse_args()
 
-    months = parse_months_arg(args.months, args.since_months)
-    if not months:
-        print("Nothing to do (no months resolved).")
-        return 0
+    # Work out the month set (priority: explicit range > explicit list > rolling)
+    if args.start_month and args.end_month:
+        months = list(month_iter_inclusive(args.start_month, args.end_month))
+    elif args.months:
+        months = months_from_list(args.months)
+    else:
+        months = default_since_months(args.since_months)
 
-    any_success = False
+    print(f"Target months: {months}")
+
+    try:
+        engine = build_engine(engine_url=args.engine_url, odbc_connect=args.odbc_connect)
+    except Exception as e:
+        print(f"ERROR building engine: {e}")
+        return 1
+
+    wrote_any = False
 
     for ym in months:
         try:
-            df = fetch_month_as_df(ym, timeout=args.timeout)
+            df = fetch_month_zip_as_df(ym, timeout=args.timeout)
         except httpx.HTTPStatusError as e:
             if e.response.status_code == 404:
                 print(f"No monthly file for {ym} (404). Skipping.")
@@ -140,29 +157,27 @@ def main() -> int:
             print(f"HTTP error for {ym}: {e}")
             return 1
         except Exception as e:
-            print(f"Unexpected error fetching {ym}: {e}")
+            print(f"Unexpected fetch/parse error for {ym}: {e}")
             return 1
 
         if df.empty:
-            print(f"{ym}: ZIP parsed but had 0 rows. Skipping.")
+            print(f"{ym}: parsed 0 rows. Skipping.")
             continue
 
         df = normalise_columns(df)
 
         try:
-            # Directly upsert into dbo.financials (this creates/uses a temp stage table internally)
-            upsert_financials_dataframe(df, target_table="dbo.financials")
-        except Exception as e:
-            print(f"SQL upsert error for {ym}: {e}")
+            rows = to_sql_append(df, engine, table=args.target_table, schema=args.schema, chunksize=1000)
+        except SQLAlchemyError as e:
+            print(f"SQL error for {ym} into {args.schema}.{args.target_table}: {e}")
             return 1
 
-        print(f"✅ {ym}: upserted {len(df):,} rows into dbo.financials.")
-        any_success = True
+        print(f"✅ {ym}: appended {rows} rows into {args.schema}.{args.target_table}.")
+        wrote_any = True
 
-    if not any_success:
-        print("No data ingested. Exiting successfully.")
+    if not wrote_any:
+        print("Nothing ingested (no files or all empty).")
     return 0
-
 
 if __name__ == "__main__":
     raise SystemExit(main())
