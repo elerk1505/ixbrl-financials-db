@@ -1,50 +1,57 @@
-name: Bulk ingest monthly CH accounts → Azure SQL
+name: Monthly iXBRL Financials Ingest → Azure SQL
 
 on:
   workflow_dispatch:
     inputs:
-      YEAR:
-        description: "Year (e.g., 2024) — or leave blank to use range"
+      MONTHS:
+        description: 'Comma-separated YYYY-MM list (e.g. 2024-01,2024-02). Leave blank to use SINCE_MONTHS.'
         required: false
-        default: ""
-      START:
-        description: "Start (YYYY-MM)"
+        default: ''
+      SINCE_MONTHS:
+        description: 'If MONTHS is blank: ingest current month back N-1 months (default 1).'
         required: false
-        default: ""
-      END:
-        description: "End (YYYY-MM)"
-        required: false
-        default: ""
+        default: '1'
 
 permissions:
-  id-token: write          # ← required for OIDC
+  id-token: write
   contents: read
 
+concurrency:
+  group: monthly-ixbrl-to-azure
+  cancel-in-progress: false
+
 jobs:
-  ingest:
+  ingest-monthlies:
     runs-on: ubuntu-latest
     timeout-minutes: 720
     env:
-      # Your Python code uses these:
-      AZURE_SQL_SERVER:   ${{ secrets.AZURE_SQL_SERVER }}        # e.g. ixbrl-sql-server.database.windows.net
+      # Python expects these:
+      AZURE_SQL_SERVER:   ${{ secrets.AZURE_SQL_SERVER }}
       AZURE_SQL_DATABASE: ${{ secrets.AZURE_SQL_DATABASE }}
-      AZURE_SQL_USERNAME: ${{ secrets.AZURE_SQL_USERNAME }}      # often user@ixbrl-sql-server
+      AZURE_SQL_USERNAME: ${{ secrets.AZURE_SQL_USERNAME }}
       AZURE_SQL_PASSWORD: ${{ secrets.AZURE_SQL_PASSWORD }}
+      AZURE_SQL_ODBC:     ${{ secrets.AZURE_SQL_ODBC }}
 
-      # Azure CLI for firewall:
-      AZ_SUBSCRIPTION:    ${{ secrets.AZURE_SUBSCRIPTION_ID }}
-      AZ_RG:              ${{ secrets.AZURE_RESOURCE_GROUP }}     # ixbrl-financials-rg
-      AZ_SQL_NAME:        ${{ secrets.AZURE_SQL_SERVER_NAME }}    # ixbrl-sql-server
+      # For the script's month selection
+      MONTHS:        ${{ github.event.inputs.MONTHS }}
+      SINCE_MONTHS:  ${{ github.event.inputs.SINCE_MONTHS }}
+
+      # Azure CLI (for firewall open/close)
+      AZ_SUBSCRIPTION: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      AZ_RG:           ${{ secrets.AZURE_RESOURCE_GROUP }}
+      AZ_SQL_NAME:     ${{ secrets.AZURE_SQL_SERVER_NAME }}
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11"
           cache: "pip"
 
-      # OIDC login (no client secret needed)
+      # OIDC login
       - name: Azure Login (OIDC)
         uses: azure/login@v2
         with:
@@ -52,7 +59,7 @@ jobs:
           tenant-id:       ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
-      # Temporarily allow the runner IP to hit Azure SQL
+      # Open firewall to runner IP
       - name: Allow runner IP in Azure SQL firewall
         shell: bash
         run: |
@@ -69,17 +76,19 @@ jobs:
             --end-ip-address "$RUNNER_IP"
           echo "FW_RULE_NAME=$RULE_NAME" >> "$GITHUB_ENV"
 
-      - name: Install ODBC driver & deps
+      - name: Install system deps (ODBC)
         run: |
           sudo su -c 'curl https://packages.microsoft.com/keys/microsoft.asc | apt-key add -'
           sudo su -c 'curl https://packages.microsoft.com/config/ubuntu/22.04/prod.list > /etc/apt/sources.list.d/mssql-release.list'
           sudo apt-get update
           sudo ACCEPT_EULA=Y apt-get install -y msodbcsql18 unixodbc-dev
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
 
-      # (optional) quick connectivity test
-      - name: Connectivity check
+      - name: Install Python deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install httpx pandas stream-read-xbrl sqlalchemy pyodbc
+
+      - name: Connectivity check (optional)
         shell: bash
         run: |
           python - <<'PY'
@@ -90,19 +99,19 @@ jobs:
                 f"Uid={os.getenv('AZURE_SQL_USERNAME')};"
                 f"Pwd={os.getenv('AZURE_SQL_PASSWORD')};"
                 "Encrypt=yes;TrustServerCertificate=no;Connection Timeout=60;")
+          print("Attempting test connection…")
           with pyodbc.connect(cs) as c:
               cur=c.cursor(); cur.execute("SELECT 1"); print("SELECT 1 ->", cur.fetchone()[0])
+          print("Connectivity OK")
           PY
 
-      - name: Ingest (choose year or start/end)
+      - name: Run monthly ingest
         run: |
-          if [ -n "${{ github.event.inputs.YEAR }}" ]; then
-            python ingest_monthly_financials.py --year "${{ github.event.inputs.YEAR }}"
-          else
-            python ingest_monthly_financials.py --start "${{ github.event.inputs.START }}" --end "${{ github.event.inputs.END }}"
-          fi
+          python scripts/ingest_monthly_financials.py \
+            --months "${MONTHS}" \
+            --since-months "${SINCE_MONTHS}"
 
-      # Always close the firewall hole
+      # Always close firewall rule
       - name: Remove runner IP from firewall
         if: always()
         shell: bash
@@ -112,5 +121,4 @@ jobs:
           az sql server firewall-rule delete \
             --resource-group "$AZ_RG" \
             --server "$AZ_SQL_NAME" \
-            --name "$FW_RULE_NAME" \
-            --yes || true
+            --name "$FW_RULE_NAME" || true
