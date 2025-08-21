@@ -189,13 +189,13 @@ def fetch_month_zip_as_df(yyyy_mm: str, timeout: float = 180.0) -> pd.DataFrame:
 # -----------------------------
 
 def normalise_columns(df: pd.DataFrame) -> pd.DataFrame:
-    # Create canonical 'company_number' if needed
-    if "company_number" not in df.columns and "companies_house_registered_number" in df.columns:
+    # Ensure we always have a canonical company_number column
+    if "companies_house_registered_number" in df.columns:
         df["company_number"] = (
-            df["companies_house_registered_number"].astype(str).str.replace(" ", "", regex=False)
+            df["companies_house_registered_number"]
+            .astype(str)   # convert to string
+            .str.replace(" ", "", regex=False)   # strip spaces
         )
-    elif "company_number" in df.columns:
-        df["company_number"] = df["company_number"].astype(str).str.replace(" ", "", regex=False)
 
     # Canonicalise 'period_end'
     for cand in ("period_end", "balance_sheet_date", "date_end", "yearEnd"):
