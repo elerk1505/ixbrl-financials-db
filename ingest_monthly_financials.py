@@ -111,28 +111,28 @@ def get_table_columns(engine: Engine, schema: str, table: str) -> List[str]:
 
 
 def align_df_to_table(df: pd.DataFrame, table_columns: Sequence[str]) -> pd.DataFrame:
-    """
-    - Deduplicate incoming columns
-    - Map company_number -> companies_house_registered_number when needed
-    - Clean company number strings (strip spaces)
-    - Keep only columns that exist in the target table
-    """
-    df = dedupe_columns(df)
     cols_set = set(table_columns)
 
-    # Map company_number to the column your table actually has
-    if "company_number" in df.columns and "companies_house_registered_number" in cols_set:
+    # If both company_number and companies_house_registered_number exist,
+    # prefer companies_house_registered_number (drop duplicate).
+    if "company_number" in df.columns and "companies_house_registered_number" in df.columns:
+        # Drop the plain company_number to avoid duplicates
+        df = df.drop(columns=["company_number"])
+
+    # If only company_number exists but the table expects companies_house_registered_number, rename
+    elif "company_number" in df.columns and "companies_house_registered_number" in cols_set:
         df = df.rename(columns={"company_number": "companies_house_registered_number"})
 
-    # Clean company number strings if present
+    # Normalise company_number style columns if present
     for cname in ("companies_house_registered_number", "company_number"):
         if cname in df.columns:
-            s = series_or_first(df, cname)
-            df[cname] = s.astype(str).str.replace(" ", "", regex=False)
+            df[cname] = df[cname].astype(str).str.replace(" ", "", regex=False)
 
-    # Keep only columns that exist in the table
+    # Keep only the columns the table actually has
     keep = [c for c in df.columns if c in cols_set]
-    return df[keep].copy()
+    filtered = df[keep].copy()
+
+    return filtered
 
 
 # -----------------------------
