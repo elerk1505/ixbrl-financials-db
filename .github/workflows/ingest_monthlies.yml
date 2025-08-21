@@ -31,7 +31,7 @@ concurrency:
 
 jobs:
   ingest-monthlies:
-    # IMPORTANT: jammy is supported by Microsoft ODBC repo
+    # Pin to jammy because Microsoft repo fully supports it
     runs-on: ubuntu-22.04
     timeout-minutes: 240
     env:
@@ -68,7 +68,7 @@ jobs:
         run: |
           set -euo pipefail
           az account set --subscription "$AZ_SUBSCRIPTION"
-          RUNNER_IP=$(curl -s https://api.ipify.org)
+          RUNNER_IP=$(curl -fsSL https://api.ipify.org)
           echo "Runner public IP: $RUNNER_IP"
           RULE_NAME="gha-${{ github.run_id }}"
           az sql server firewall-rule create \
@@ -80,15 +80,24 @@ jobs:
           echo "FW_RULE_NAME=$RULE_NAME" >> "$GITHUB_ENV"
 
       - name: Install system deps (ODBC)
-        # Clean, non-interactive install for jammy
         shell: bash
         run: |
           set -euo pipefail
-          sudo mkdir -p /usr/share/keyrings
-          curl -fsSL https://packages.microsoft.com/keys/microsoft.asc | sudo gpg --dearmor -o /usr/share/keyrings/microsoft-prod.gpg
-          echo "deb [arch=amd64,arm64 signed-by=/usr/share/keyrings/microsoft-prod.gpg] https://packages.microsoft.com/ubuntu/22.04/prod jammy main" | sudo tee /etc/apt/sources.list.d/microsoft-prod.list > /dev/null
+
+          # Clean up any stray microsoft repo lists that might conflict
+          sudo rm -f /etc/apt/sources.list.d/microsoft-prod.list \
+                     /etc/apt/sources.list.d/mssql-release.list || true
+
+          # Add Microsoft repo key (keyring, non-interactive)
+          curl -fsSL https://packages.microsoft.com/keys/microsoft.asc \
+            | sudo gpg --dearmor -o /usr/share/keyrings/microsoft-prod.gpg
+
+          # Add Microsoft repo for JAMMY (22.04)
+          echo "deb [arch=amd64,arm64 signed-by=/usr/share/keyrings/microsoft-prod.gpg] https://packages.microsoft.com/ubuntu/22.04/prod jammy main" \
+            | sudo tee /etc/apt/sources.list.d/microsoft-prod.list >/dev/null
+
           sudo apt-get update
-          sudo ACCEPT_EULA=Y apt-get install -y msodbcsql18 unixodbc-dev
+          sudo ACCEPT_EULA=Y apt-get install -y msodbcsql18 unixodbc unixodbc-dev
 
       - name: Install Python deps
         run: |
@@ -110,12 +119,13 @@ jobs:
           for attempt in range(1, 7):
               try:
                   with pyodbc.connect(cs) as c:
-                      cur = c.cursor(); cur.execute("SELECT 1"); print("Connectivity OK:", cur.fetchone()[0]); sys.exit(0)
+                      cur=c.cursor(); cur.execute("SELECT 1"); print("Connectivity OK: SELECT 1 ->", cur.fetchone()[0])
+                      sys.exit(0)
               except Exception as e:
                   last_err = e
                   print(f"[attempt {attempt}/6] connect failed: {e}")
                   time.sleep(5)
-          print("ERROR: could not connect after retries.", last_err)
+          print("ERROR: could not connect after retries.")
           raise SystemExit(1)
           PY
 
