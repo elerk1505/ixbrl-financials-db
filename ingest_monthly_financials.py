@@ -2,35 +2,97 @@
 # -*- coding: utf-8 -*-
 
 """
-Companies House MONTHLY iXBRL -> Azure SQL
+Companies House MONTHLY iXBRL -> Azure SQL (resilient)
 
-- Month selection: --start-month/--end-month | --months | --since-months
-- Robust download with retry + Content-Length validation
-- Stage (NVARCHAR) -> Insert into target with TRY_CONVERT for dates/numbers
-- Skip duplicates using NOT EXISTS on (companies_house_registered_number, [date])
+Usage examples:
+  # explicit range
+  python ingest_monthly_financials.py --start-month 2025-01 --end-month 2025-06 --odbc-connect "<pyodbc_connstr>" --schema dbo --target-table financials
+
+  # last N months (N=1 => current month only)
+  python ingest_monthly_financials.py --since-months 1 --odbc-connect "<pyodbc_connstr>"
+
+Notes:
+- Skips months that 404 (not yet published) without failing the whole run.
+- Handles partial downloads with verify+resume.
+- Upserts via MERGE on (companies_house_registered_number, period_end).
+- Writes only concise progress logs (no per-row spam).
 """
 
 from __future__ import annotations
 import argparse
-import os
+import calendar
 import io
+import os
+import sys
+import tempfile
 import time
+from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import date, datetime, timezone
-from typing import Iterable, List, Optional, Sequence, Tuple
+from typing import Iterable, List, Optional, Sequence, Tuple, Dict
 
 import httpx
 import pandas as pd
 from sqlalchemy import create_engine, inspect, text
-from sqlalchemy.engine import Engine
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.engine import Engine, Connection
+from sqlalchemy.exc import SQLAlchemyError, OperationalError, ProgrammingError
+
+# external parser (as used previously)
+from stream_read_xbrl import stream_read_xbrl_zip
+
 
 # -----------------------------
-# Helpers: month handling
+# Config / constants
 # -----------------------------
+
+# Your full, desired target columns (we'll align/empty-fill as needed)
+DESIRED_COLUMNS: List[str] = [
+    "run_code", "company_id", "date", "file_type", "taxonomy", "balance_sheet_date",
+    "companies_house_registered_number", "entity_current_legal_name", "company_dormant",
+    "average_number_employees_during_period", "period_start", "period_end", "tangible_fixed_assets",
+    "debtors", "cash_bank_in_hand", "current_assets", "creditors_due_within_one_year",
+    "creditors_due_after_one_year", "net_current_assets_liabilities", "total_assets_less_current_liabilities",
+    "net_assets_liabilities_including_pension_asset_liability", "called_up_share_capital",
+    "profit_loss_account_reserve", "shareholder_funds", "turnover_gross_operating_revenue",
+    "other_operating_income", "cost_sales", "gross_profit_loss", "administrative_expenses",
+    "raw_materials_consumables", "staff_costs", "depreciation_other_amounts_written_off_tangible_intangible_fixed_assets",
+    "other_operating_charges_format2", "operating_profit_loss", "profit_loss_on_ordinary_activities_before_tax",
+    "tax_on_profit_or_loss_on_ordinary_activities", "profit_loss_for_period", "error", "zip_url",
+]
+
+HTTP_TIMEOUT = 180.0
+HTTP_ATTEMPTS = 5
+SQL_ATTEMPTS = 5
+RESUME_CHUNK = 1024 * 1024  # 1MB
+CHUNK_SIZE = 64 * 1024
+
+
+# -----------------------------
+# Utilities
+# -----------------------------
+
+def dedupe_columns(df: pd.DataFrame) -> pd.DataFrame:
+    if df.columns.duplicated().any():
+        df = df.loc[:, ~df.columns.duplicated()].copy()
+    return df
+
+
+def series_or_first(df: pd.DataFrame, name: str) -> pd.Series:
+    obj = df[name]
+    if isinstance(obj, pd.DataFrame):
+        return obj.iloc[:, 0]
+    return obj
+
+
+def month_name_en(ym: str) -> str:
+    y, m = ym.split("-", 1)
+    return calendar.month_name[int(m)]
+
 
 def parse_yyyy_mm(s: str) -> date:
     y, m = s.split("-", 1)
     return date(int(y), int(m), 1)
+
 
 def month_iter_inclusive(start_ym: str, end_ym: str) -> Iterable[str]:
     cur = parse_yyyy_mm(start_ym)
@@ -42,8 +104,10 @@ def month_iter_inclusive(start_ym: str, end_ym: str) -> Iterable[str]:
             y, m = y + 1, 1
         cur = date(y, m, 1)
 
+
 def months_from_list(csv: str) -> List[str]:
     return [x.strip() for x in csv.split(",") if x.strip()]
+
 
 def default_since_months(n: int) -> List[str]:
     today = datetime.now(timezone.utc).date().replace(day=1)
@@ -56,17 +120,9 @@ def default_since_months(n: int) -> List[str]:
             y, m = y - 1, 12
     return out
 
-# -----------------------------
-# CH URLs
-# -----------------------------
-
-def month_name_en(ym: str) -> str:
-    import calendar
-    dt = parse_yyyy_mm(ym)
-    return calendar.month_name[dt.month]  # e.g. January
 
 def candidate_urls_for_month(ym: str) -> List[str]:
-    """Return URL candidates from newest to oldest."""
+    """Companies House monthly ZIPs: live first, then archive; special 2008/2009 yearly bundles."""
     y = parse_yyyy_mm(ym).year
     mon = month_name_en(ym)
     live = f"https://download.companieshouse.gov.uk/Accounts_Monthly_Data-{mon}{y}.zip"
@@ -76,96 +132,156 @@ def candidate_urls_for_month(ym: str) -> List[str]:
         urls.append(f"https://download.companieshouse.gov.uk/archive/Accounts_Monthly_Data-JanuaryToDecember{y}.zip")
     return urls
 
+
 # -----------------------------
-# HTTP download with verification
+# HTTP download with verify+resume
 # -----------------------------
 
-def download_bytes(url: str, timeout: float, max_attempts: int = 5, sleep_secs: float = 5.0) -> bytes:
-    for attempt in range(1, max_attempts + 1):
-        try:
-            with httpx.stream("GET", url, timeout=timeout) as r:
-                r.raise_for_status()
-                expected = int(r.headers.get("Content-Length") or 0)
-                buf = io.BytesIO()
-                for chunk in r.iter_bytes():
-                    if chunk:
-                        buf.write(chunk)
-                data = buf.getvalue()
-                if expected and len(data) != expected:
-                    raise IOError(f"incomplete body: got {len(data)} expected {expected}")
-                return data
-        except httpx.HTTPStatusError as e:
-            # Only retry non-404s; 404 means move to next candidate URL
-            if e.response is not None and e.response.status_code == 404:
-                raise
-            print(f"  download attempt {attempt}/{max_attempts} failed: {e}")
-        except Exception as e:
-            print(f"  download attempt {attempt}/{max_attempts} failed: {e}")
-        time.sleep(sleep_secs)
-    raise IOError("download failed after retries")
+class IncompleteBody(Exception):
+    pass
 
-def fetch_month_zip_as_df(yyyy_mm: str, timeout: float = 180.0) -> pd.DataFrame:
-    from stream_read_xbrl import stream_read_xbrl_zip
-    last_err: Optional[Exception] = None
-    for url in candidate_urls_for_month(yyyy_mm):
-        print(f"Fetching month: {yyyy_mm} -> {url}")
+
+def _append_range(client: httpx.Client, url: str, fp, start: int, expected: Optional[int]) -> int:
+    headers = {"Range": f"bytes={start}-"}
+    with client.stream("GET", url, headers=headers, timeout=HTTP_TIMEOUT) as r:
+        r.raise_for_status()
+        for chunk in r.iter_bytes(CHUNK_SIZE):
+            if chunk:
+                fp.write(chunk)
+    fp.flush()
+    return os.fstat(fp.fileno()).st_size
+
+
+def download_zip_with_retries(urls: List[str]) -> Optional[str]:
+    """
+    Try each URL in order; for each, attempt up to HTTP_ATTEMPTS with content-length verification
+    and Range resume if short. Returns path to a complete ZIP file or None if 404 on all.
+    """
+    for url in urls:
         try:
-            blob = download_bytes(url, timeout=timeout)
-            # parse from in-memory bytes with the streaming parser
-            with stream_read_xbrl_zip(iter([blob])) as (columns, rows):
-                data = [[("" if v is None else str(v)) for v in row] for row in rows]
-            df = pd.DataFrame(data, columns=columns)
-            if df.columns.duplicated().any():
-                df = df.loc[:, ~df.columns.duplicated()].copy()
-            # remember where this row came from
-            df["zip_url"] = url
-            return df
+            with httpx.Client(follow_redirects=True) as client:
+                # initial GET to know content-length
+                for attempt in range(1, HTTP_ATTEMPTS + 1):
+                    try:
+                        with client.stream("GET", url, timeout=HTTP_TIMEOUT) as r:
+                            if r.status_code == 404:
+                                # Try next candidate URL
+                                break
+                            r.raise_for_status()
+                            expected = r.headers.get("Content-Length")
+                            expected = int(expected) if (expected and expected.isdigit()) else None
+
+                            # write to temp
+                            fd, tmp = tempfile.mkstemp(prefix="ch_month_", suffix=".zip")
+                            os.close(fd)
+                            size = 0
+                            try:
+                                with open(tmp, "wb") as f:
+                                    for chunk in r.iter_bytes(CHUNK_SIZE):
+                                        if chunk:
+                                            f.write(chunk)
+                                size = os.path.getsize(tmp)
+
+                                # verify
+                                if expected is not None and size < expected:
+                                    # try resume if server allows
+                                    with open(tmp, "ab") as f:
+                                        size = _append_range(client, url, f, size, expected)
+                                # final check
+                                if expected is not None and size != expected:
+                                    raise IncompleteBody(f"incomplete body: got {size} expected {expected}")
+
+                                # looks good
+                                return tmp
+
+                            except Exception:
+                                # cleanup and retry
+                                try:
+                                    os.remove(tmp)
+                                except Exception:
+                                    pass
+                                raise
+                    except httpx.HTTPStatusError as e:
+                        if e.response is not None and e.response.status_code == 404:
+                            # Try next URL candidate
+                            break
+                        if attempt == HTTP_ATTEMPTS:
+                            raise
+                        time.sleep(3 * attempt)
+                    except (httpx.TransportError, IncompleteBody) as e:
+                        if attempt == HTTP_ATTEMPTS:
+                            raise
+                        time.sleep(3 * attempt)
+                # next URL candidate
         except httpx.HTTPStatusError as e:
-            if e.response is not None and e.response.status_code == 404:
-                print(f"  404 at {url}, trying next URL…")
-                last_err = e
-                continue
+            # fatal (non-404)
             raise
-        except Exception as e:
-            last_err = e
-            print(f"  fetch/parse error: {e}")
-            break
-    if last_err:
-        raise last_err
-    raise FileNotFoundError(f"No URL worked for {yyyy_mm}")
+        except Exception:
+            # try next candidate
+            continue
+    # none worked (i.e., all 404 or failed)
+    return None
+
+
+def parse_zip_to_df_from_path(zip_path: str) -> pd.DataFrame:
+    """Feed file bytes to stream_read_xbrl_zip (avoids closed network stream issues)."""
+    def file_chunks(path: str, chunk: int = CHUNK_SIZE):
+        with open(path, "rb") as f:
+            while True:
+                b = f.read(chunk)
+                if not b:
+                    break
+                yield b
+
+    with stream_read_xbrl_zip(file_chunks(zip_path)) as (columns, rows):
+        data = [[("" if v is None else str(v)) for v in row] for row in rows]
+    return dedupe_columns(pd.DataFrame(data, columns=columns))
+
 
 # -----------------------------
 # Normalisation
 # -----------------------------
 
 def normalise_columns(df: pd.DataFrame) -> pd.DataFrame:
-    # Align company number
+    df = dedupe_columns(df)
+
+    # Canonical company_number from CH registered number if present
     if "companies_house_registered_number" in df.columns:
-        s = df["companies_house_registered_number"]
-        if isinstance(s, pd.DataFrame):
-            s = s.iloc[:, 0]
+        s = series_or_first(df, "companies_house_registered_number")
         df["companies_house_registered_number"] = s.astype(str).str.replace(" ", "", regex=False)
 
-    # Canonical date column name -> "date" (source has "period_end"/"balance_sheet_date")
-    # We keep original columns too; conversion happens in SQL with TRY_CONVERT.
-    if "date" not in df.columns:
-        for cand in ("period_end", "balance_sheet_date", "date_end", "yearEnd"):
-            if cand in df.columns:
-                df = df.rename(columns={cand: "date"})
-                break
+    # Normalise period_end
+    for cand in ("period_end", "balance_sheet_date", "date_end", "yearEnd"):
+        if cand in df.columns:
+            if cand != "period_end":
+                df = df.rename(columns={cand: "period_end"})
+            break
 
-    # Make booleans/numbers safe as strings; empty becomes ''
-    for c in df.columns:
-        if pd.api.types.is_object_dtype(df[c]) or pd.api.types.is_string_dtype(df[c]):
-            continue
-        df[c] = df[c].astype(str)
+    # Ensure period_end looks like a date string (target table likely has DATE)
+    if "period_end" in df.columns:
+        s = pd.to_datetime(series_or_first(df, "period_end"), errors="coerce")
+        df["period_end"] = s.dt.strftime("%Y-%m-%d")
 
-    # standardise header spacing
-    df = df.rename(columns={c: c.strip().replace(" ", "_") for c in df.columns})
     return df
 
+
+def align_and_fill(df: pd.DataFrame, required_cols: Sequence[str]) -> pd.DataFrame:
+    """
+    Keep only the columns we need in the target, add any missing with empty strings,
+    and order them to exactly match the target order.
+    """
+    out = df.copy()
+    # add missing
+    for c in required_cols:
+        if c not in out.columns:
+            out[c] = ""
+    # keep only required
+    out = out[list(required_cols)].copy()
+    return out
+
+
 # -----------------------------
-# SQL: engine + utilities
+# SQL helpers
 # -----------------------------
 
 def build_engine(*, engine_url: Optional[str], odbc_connect: Optional[str]) -> Engine:
@@ -176,117 +292,151 @@ def build_engine(*, engine_url: Optional[str], odbc_connect: Optional[str]) -> E
         raise RuntimeError("Provide --engine-url or --odbc-connect (or set AZURE_SQL_URL/AZURE_SQL_ODBC).")
     if not engine_url:
         import urllib.parse
-        # resiliency knobs in the connection string help with transient issues
-        if "ConnectRetryCount" not in odbc_connect:
-            odbc_connect += ";ConnectRetryCount=3;ConnectRetryInterval=5"
-        if "Connection Timeout" not in odbc_connect and "ConnectionTimeout" not in odbc_connect:
-            odbc_connect += ";Connection Timeout=60"
         engine_url = "mssql+pyodbc:///?odbc_connect=" + urllib.parse.quote_plus(odbc_connect)
+    # fast_executemany improves pandas to_sql
     return create_engine(engine_url, fast_executemany=True, future=True)
 
-def qident(name: str) -> str:
-    # Quote an identifier for T‑SQL
-    return "[" + name.replace("]", "]]") + "]"
-
-def ensure_staging_table(engine: Engine, schema: str, staging: str, target_cols: Sequence[str]) -> None:
-    """Create NVARCHAR(MAX) staging table if missing."""
-    cols_sql = ",\n".join(f"{qident(c)} NVARCHAR(MAX) NULL" for c in target_cols)
-    sql = f"""
-IF NOT EXISTS (
-    SELECT 1
-    FROM sys.tables t
-    JOIN sys.schemas s ON s.schema_id = t.schema_id
-    WHERE s.name = N'{schema}' AND t.name = N'{staging}'
-)
-BEGIN
-    EXEC(N'CREATE TABLE {qident(schema)}.{qident(staging)} (
-        {cols_sql}
-    )');
-END
-"""
-    with engine.begin() as conn:
-        conn.exec_driver_sql(sql)
-
-def truncate_staging(engine: Engine, schema: str, staging: str) -> None:
-    with engine.begin() as conn:
-        conn.exec_driver_sql(f"TRUNCATE TABLE {qident(schema)}.{qident(staging)}")
 
 def get_table_columns(engine: Engine, schema: str, table: str) -> List[str]:
     insp = inspect(engine)
-    return [c["name"] for c in insp.get_columns(table, schema=schema)]
+    cols = [c["name"] for c in insp.get_columns(table, schema=schema)]
+    if not cols:
+        raise RuntimeError(f"Table {schema}.{table} not found or has no columns.")
+    return cols
 
-# -----------------------------
-# Stage -> Target insert with conversions & de-dupe
-# -----------------------------
 
-NUMERIC_COLS = {
-    "average_number_employees_during_period",
-    "tangible_fixed_assets", "debtors", "cash_bank_in_hand", "current_assets",
-    "creditors_due_within_one_year", "creditors_due_after_one_year",
-    "net_current_assets_liabilities", "total_assets_less_current_liabilities",
-    "net_assets_liabilities_including_pension_asset_liability",
-    "called_up_share_capital", "profit_loss_account_reserve", "shareholder_funds",
-    "turnover_gross_operating_revenue", "other_operating_income", "cost_sales",
-    "gross_profit_loss", "administrative_expenses", "raw_materials_consumables",
-    "staff_costs",
-    "depreciation_other_amounts_written_off_tangible_intangible_fixed_assets",
-    "other_operating_charges_format2",
-    "operating_profit_loss", "profit_loss_on_ordinary_activities_before_tax",
-    "tax_on_profit_or_loss_on_ordinary_activities", "profit_loss_for_period"
-}
-DATE_COLS = {"date", "balance_sheet_date", "period_start", "period_end"}
+def ensure_staging_table(engine: Engine, schema: str, stage_table: str, cols: Sequence[str]) -> None:
+    """
+    Create a staging table with NVARCHAR(MAX) columns mirroring the target columns.
+    """
+    cols_spec = ",\n".join(f"[{c}] NVARCHAR(MAX) NULL" for c in cols)
+    sql_exists = text("""
+    IF NOT EXISTS (
+        SELECT 1
+        FROM sys.tables t
+        JOIN sys.schemas s ON s.schema_id = t.schema_id
+        WHERE s.name = :schema AND t.name = :tname
+    )
+    BEGIN
+        EXEC(N'CREATE TABLE [' + :schema + N'].[' + :tname + N'] (
+            """ + cols_spec + """
+        )');
+    END
+    """)
+    for attempt in range(1, SQL_ATTEMPTS + 1):
+        try:
+            with engine.begin() as conn:
+                conn.execute(sql_exists, {"schema": schema, "tname": stage_table})
+            return
+        except SQLAlchemyError as e:
+            if attempt == SQL_ATTEMPTS:
+                raise
+            time.sleep(3 * attempt)
 
-def conv_expr(col: str) -> str:
-    c = qident(col)
-    if col in DATE_COLS:
-        return f"TRY_CONVERT(date, NULLIF({c}, ''))"
-    if col in NUMERIC_COLS:
-        # float is permissive and will cast to DECIMAL/NUMERIC on insert
-        return f"TRY_CONVERT(float, NULLIF({c}, ''))"
-    if col.lower() == "company_dormant":
-        return f"TRY_CONVERT(bit, NULLIF({c}, ''))"
-    # strings
-    return c
 
-def insert_new_rows(engine: Engine, schema: str, staging: str, target: str, target_cols: Sequence[str]) -> int:
-    # Build SELECT list with conversions per column
-    sel_list = ", ".join(conv_expr(c) for c in target_cols)
-    cols_list = ", ".join(qident(c) for c in target_cols)
+def sql_retry(fn, *args, **kwargs):
+    for attempt in range(1, SQL_ATTEMPTS + 1):
+        try:
+            return fn(*args, **kwargs)
+        except OperationalError as e:
+            # rollback and retry with backoff
+            if attempt == SQL_ATTEMPTS:
+                raise
+            time.sleep(3 * attempt)
+        except SQLAlchemyError:
+            if attempt == SQL_ATTEMPTS:
+                raise
+            time.sleep(3 * attempt)
 
-    # Use NOT EXISTS on (companies_house_registered_number, [date]) to skip PK duplicates
-    # If either column is missing, fall back to LEFT JOIN/IS NULL
-    match_cols = {"companies_house_registered_number", "date"}
-    if not match_cols.issubset(set(target_cols)):
-        raise RuntimeError("Target table must contain companies_house_registered_number and date columns.")
+
+def clear_staging(engine: Engine, schema: str, stage_table: str):
+    sql = text(f"DELETE FROM [{schema}].[{stage_table}]")
+    sql_retry(lambda: engine.begin().__enter__().execute(sql))
+
+
+def bulk_stage(engine: Engine, schema: str, stage_table: str, df: pd.DataFrame) -> int:
+    if df.empty:
+        return 0
+    # use pandas to_sql (append)
+    for attempt in range(1, SQL_ATTEMPTS + 1):
+        try:
+            df.to_sql(
+                name=stage_table,
+                con=engine,
+                schema=schema,
+                if_exists="append",
+                index=False,
+                dtype=None,  # we created NVARCHAR(MAX) earlier
+                chunksize=2000,
+                method=None,
+            )
+            return len(df)
+        except SQLAlchemyError:
+            if attempt == SQL_ATTEMPTS:
+                raise
+            time.sleep(3 * attempt)
+    return 0
+
+
+def merge_upsert(engine: Engine, schema: str, target_table: str, stage_table: str, cols: Sequence[str]) -> Tuple[int, int]:
+    """
+    MERGE from stage -> target on (companies_house_registered_number, period_end).
+    Returns (updated_rows, inserted_rows).
+    """
+    key_a, key_b = "companies_house_registered_number", "period_end"
+    if key_a not in cols or key_b not in cols:
+        # Nothing to merge safely (shouldn't happen given your table); do nothing.
+        return (0, 0)
+
+    # All non-key columns
+    non_keys = [c for c in cols if c not in (key_a, key_b)]
+    set_list = ", ".join(f"T.[{c}] = S.[{c}]" for c in non_keys)
+    insert_cols = ", ".join(f"[{c}]" for c in cols)
+    values_cols = ", ".join(f"S.[{c}]" for c in cols)
 
     sql = f"""
-INSERT INTO {qident(schema)}.{qident(target)} ({cols_list})
-SELECT {sel_list}
-FROM {qident(schema)}.{qident(staging)} s
-WHERE NOT EXISTS (
-    SELECT 1
-    FROM {qident(schema)}.{qident(target)} t
-    WHERE t.{qident('companies_house_registered_number')} = s.{qident('companies_house_registered_number')}
-      AND t.{qident('date')} = TRY_CONVERT(date, NULLIF(s.{qident('date')}, ''))
-);
-SELECT @@ROWCOUNT AS inserted;
-"""
-    with engine.begin() as conn:
-        res = conn.exec_driver_sql(sql)
-        # SQLAlchemy returns a cursor-like object; fetch scalar rowcount via first()
+    SET NOCOUNT ON;
+
+    MERGE [{schema}].[{target_table}] AS T
+    USING (
+        SELECT {insert_cols}
+        FROM [{schema}].[{stage_table}]
+        WHERE [{key_a}] IS NOT NULL AND [{key_b}] IS NOT NULL
+    ) AS S
+    ON  T.[{key_a}] = S.[{key_a}] AND T.[{key_b}] = S.[{key_b}]
+    WHEN MATCHED THEN
+        UPDATE SET {set_list}
+    WHEN NOT MATCHED THEN
+        INSERT ({insert_cols}) VALUES ({values_cols})
+    OUTPUT $action AS MergeAction;
+    """
+
+    updated = inserted = 0
+    for attempt in range(1, SQL_ATTEMPTS + 1):
         try:
-            row = res.fetchone()
-            return int(row[0]) if row is not None else 0
-        except Exception:
-            # Fallback if driver doesn't return @@ROWCOUNT
-            return res.rowcount if res.rowcount is not None else 0
+            with engine.begin() as conn:
+                res = conn.exec_driver_sql(sql)
+                # Count actions from OUTPUT
+                for row in res:
+                    if row[0] == "UPDATE":
+                        updated += 1
+                    elif row[0] == "INSERT":
+                        inserted += 1
+            break
+        except SQLAlchemyError:
+            if attempt == SQL_ATTEMPTS:
+                raise
+            time.sleep(3 * attempt)
+
+    return updated, inserted
+
 
 # -----------------------------
 # Main
 # -----------------------------
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="Ingest MONTHLY iXBRL zips into Azure SQL.")
+    ap = argparse.ArgumentParser(description="Resilient ingest of MONTHLY iXBRL zips into Azure SQL.")
     # Month selection
     ap.add_argument("--start-month", help="YYYY-MM start (inclusive).")
     ap.add_argument("--end-month", help="YYYY-MM end (inclusive).")
@@ -298,12 +448,11 @@ def main() -> int:
     ap.add_argument("--schema", default="dbo")
     ap.add_argument("--target-table", default="financials")
     ap.add_argument("--staging-table", default="financials_stage")
-    # Network / resiliency
-    ap.add_argument("--timeout", type=float, default=180.0)
-    ap.add_argument("--max-fetch-attempts", type=int, default=5)
+    ap.add_argument("--timeout", type=float, default=HTTP_TIMEOUT)
 
     args = ap.parse_args()
 
+    # Build month list
     if args.start_month and args.end_month:
         months = list(month_iter_inclusive(args.start_month, args.end_month))
     elif args.months:
@@ -311,97 +460,101 @@ def main() -> int:
     else:
         months = default_since_months(args.since_months)
 
-    print(f"*** --schema {args.schema} --target-table {args.target_table}")
-    print(f"Target months: {months}")
+    # Build engine
+    engine = build_engine(engine_url=args.engine_url, odbc_connect=args.odbc_connect)
 
-    # Engine
-    try:
-        engine = build_engine(engine_url=args.engine_url, odbc_connect=args.odbc_connect)
-    except Exception as e:
-        print(f"ERROR building engine: {e}")
-        return 1
-
-    # Discover target columns
+    # Identify target schema/table columns
     try:
         target_cols = get_table_columns(engine, args.schema, args.target_table)
-        if not target_cols:
-            print(f"ERROR: target table {args.schema}.{args.target_table} not found or has no columns.")
-            return 1
     except Exception as e:
-        print(f"ERROR inspecting target: {e}")
+        print(f"ERROR inspecting {args.schema}.{args.target_table}: {e}")
         return 1
 
-    # Make sure staging exists and is clean before each month
+    # Use intersection of DESIRED_COLUMNS and target table to drive shape
+    col_order = [c for c in DESIRED_COLUMNS if c in target_cols]
+    if not col_order:
+        print(f"ERROR: target table {args.schema}.{args.target_table} has no overlap with DESIRED_COLUMNS.")
+        return 1
+
+    # Ensure staging table exists
     try:
-        ensure_staging_table(engine, args.schema, args.staging_table, target_cols)
+        ensure_staging_table(engine, args.schema, args.staging_table, col_order)
     except Exception as e:
         print(f"ERROR ensuring staging table: {e}")
         return 1
 
-    wrote_any = False
+    print(f"Target months: {months}")
+
+    any_success = False
 
     for ym in months:
-        # fetch & parse
+        urls = candidate_urls_for_month(ym)
+        print(f"Fetching month: {ym} -> {urls[0]}")
+
+        # 1) Download
         try:
-            df = fetch_month_zip_as_df(ym, timeout=args.timeout)
-        except httpx.HTTPStatusError as e:
-            print(f"{ym}: fetch/parse error: {e}")
-            return 1
+            zip_path = download_zip_with_retries(urls)
+            if not zip_path:
+                print(f"{ym}: no ZIP available yet (404 on all candidates). Skipping.")
+                continue
+        except IncompleteBody as e:
+            print(f"{ym}: download error: {e}. Skipping.")
+            continue
+        except httpx.HTTPError as e:
+            print(f"{ym}: HTTP error: {e}. Skipping.")
+            continue
         except Exception as e:
-            print(f"{ym}: fetch/parse error: {e}")
-            return 1
+            print(f"{ym}: unexpected download error: {e}. Skipping.")
+            continue
+
+        # 2) Parse
+        try:
+            df = parse_zip_to_df_from_path(zip_path)
+        except Exception as e:
+            print(f"{ym}: parse error: {e}. Skipping.")
+            try:
+                os.remove(zip_path)
+            except Exception:
+                pass
+            continue
+        finally:
+            try:
+                os.remove(zip_path)
+            except Exception:
+                pass
 
         if df.empty:
             print(f"{ym}: parsed 0 rows. Skipping.")
             continue
 
-        # normalise columns and align to target schema
+        # 3) Normalise
         df = normalise_columns(df)
-        keep = [c for c in df.columns if c in set(target_cols)]
-        df = df[keep].copy()
+        # add metadata columns we control
+        df["zip_url"] = urls[0]
+        if "error" not in df.columns:
+            df["error"] = ""
 
-        # write to staging (transaction per month; guaranteed rollback on error)
+        # 4) Align to target shape
+        df_final = align_and_fill(df, col_order)
+
+        # 5) Stage -> MERGE
         try:
-            truncate_staging(engine, args.schema, args.staging_table)
+            # clear staging fully per-month (keeps transactions simple)
+            clear_staging(engine, args.schema, args.staging_table)
+
+            staged_rows = bulk_stage(engine, args.schema, args.staging_table, df_final)
+            updated, inserted = merge_upsert(engine, args.schema, args.target_table, args.staging_table, col_order)
+
+            print(f"✅ {ym}: staged {staged_rows:,} | upserted: {inserted:,} insert(s), {updated:,} update(s).")
+            any_success = True
         except Exception as e:
-            print(f"{ym}: staging cleanup error: {e}")
+            print(f"{ym}: staging/merge error: {e}")
             return 1
 
-        try:
-            with engine.begin() as conn:
-                # use fast_executemany via pandas; all NVARCHAR(MAX) in stage
-                df.to_sql(
-                    name=args.staging_table,
-                    con=conn,
-                    schema=args.schema,
-                    if_exists="append",
-                    index=False,
-                    chunksize=1000,
-                    method=None,
-                )
-        except SQLAlchemyError as e:
-            print(f"{ym}: staging SQL error: {e}")
-            return 1
-        except Exception as e:
-            print(f"{ym}: staging unexpected error: {e}")
-            return 1
-
-        # insert new rows into target with conversions + de-dupe
-        try:
-            inserted = insert_new_rows(engine, args.schema, args.staging_table, args.target_table, target_cols)
-            print(f"✅ {ym}: inserted {inserted} new rows into {args.schema}.{args.target_table}.")
-            if inserted > 0:
-                wrote_any = True
-        except SQLAlchemyError as e:
-            print(f"{ym}: merge/insert SQL error: {e}")
-            return 1
-        except Exception as e:
-            print(f"{ym}: merge/insert unexpected error: {e}")
-            return 1
-
-    if not wrote_any:
-        print("Nothing ingested (all months empty or all rows already present).")
+    if not any_success:
+        print("Nothing ingested (no files or all months skipped/empty).")
     return 0
 
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    sys.exit(main())
