@@ -2,22 +2,28 @@
 # -*- coding: utf-8 -*-
 
 """
-Monthly iXBRL -> Azure SQL
+Monthly iXBRL -> Azure SQL (Companies House monthly ZIPs)
 
 Choose months via:
-  A) Range   : --start-month YYYY-MM --end-month YYYY-MM  (inclusive)
-  B) List    : --months 2024-01,2024-02
-  C) Lookback: --since-months N (N=1 => current month only)
+  --start-month YYYY-MM --end-month YYYY-MM    (inclusive)
+  --months 2024-01,2024-02
+  --since-months N   (default 1)
 
-Writes into the requested table (default dbo.financials). Before writing, the
-DataFrame is aligned to the table's columns to prevent "Invalid column name" errors.
-
-Monthly ZIP URL patterns:
-  - Live    : https://download.companieshouse.gov.uk/Accounts_Monthly_Data-{Month}{YYYY}.zip
-  - Archive : https://download.companieshouse.gov.uk/archive/Accounts_Monthly_Data-{Month}{YYYY}.zip
-  - Special : https://download.companieshouse.gov.uk/archive/Accounts_Monthly_Data-JanuaryToDecember{YYYY}.zip  (2008, 2009)
-
-Requires: httpx pandas stream-read-xbrl sqlalchemy pyodbc
+Table schema (39 columns, in order):
+run_code, company_id, date, file_type, taxonomy, balance_sheet_date,
+companies_house_registered_number, entity_current_legal_name, company_dormant,
+average_number_employees_during_period, period_start, period_end,
+tangible_fixed_assets, debtors, cash_bank_in_hand, current_assets,
+creditors_due_within_one_year, creditors_due_after_one_year,
+net_current_assets_liabilities, total_assets_less_current_liabilities,
+net_assets_liabilities_including_pension_asset_liability, called_up_share_capital,
+profit_loss_account_reserve, shareholder_funds, turnover_gross_operating_revenue,
+other_operating_income, cost_sales, gross_profit_loss, administrative_expenses,
+raw_materials_consumables, staff_costs,
+depreciation_other_amounts_written_off_tangible_intangible_fixed_assets,
+other_operating_charges_format2, operating_profit_loss,
+profit_loss_on_ordinary_activities_before_tax,
+tax_on_profit_or_loss_on_ordinary_activities, profit_loss_for_period, error, zip_url
 """
 
 from __future__ import annotations
@@ -32,36 +38,102 @@ from sqlalchemy import create_engine, inspect
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import SQLAlchemyError
 
+# -----------------------------
+# Target table definition (order matters)
+# -----------------------------
+TARGET_COLS: List[str] = [
+    "run_code",
+    "company_id",
+    "date",
+    "file_type",
+    "taxonomy",
+    "balance_sheet_date",
+    "companies_house_registered_number",
+    "entity_current_legal_name",
+    "company_dormant",
+    "average_number_employees_during_period",
+    "period_start",
+    "period_end",
+    "tangible_fixed_assets",
+    "debtors",
+    "cash_bank_in_hand",
+    "current_assets",
+    "creditors_due_within_one_year",
+    "creditors_due_after_one_year",
+    "net_current_assets_liabilities",
+    "total_assets_less_current_liabilities",
+    "net_assets_liabilities_including_pension_asset_liability",
+    "called_up_share_capital",
+    "profit_loss_account_reserve",
+    "shareholder_funds",
+    "turnover_gross_operating_revenue",
+    "other_operating_income",
+    "cost_sales",
+    "gross_profit_loss",
+    "administrative_expenses",
+    "raw_materials_consumables",
+    "staff_costs",
+    "depreciation_other_amounts_written_off_tangible_intangible_fixed_assets",
+    "other_operating_charges_format2",
+    "operating_profit_loss",
+    "profit_loss_on_ordinary_activities_before_tax",
+    "tax_on_profit_or_loss_on_ordinary_activities",
+    "profit_loss_for_period",
+    "error",
+    "zip_url",
+]
+
+DATE_COLS = {"date", "balance_sheet_date", "period_start", "period_end"}
+BOOL_COLS = {"company_dormant"}
+# Everything numeric that isn’t date/bool/string-ish:
+NUMERIC_COLS = {
+    "average_number_employees_during_period",
+    "tangible_fixed_assets",
+    "debtors",
+    "cash_bank_in_hand",
+    "current_assets",
+    "creditors_due_within_one_year",
+    "creditors_due_after_one_year",
+    "net_current_assets_liabilities",
+    "total_assets_less_current_liabilities",
+    "net_assets_liabilities_including_pension_asset_liability",
+    "called_up_share_capital",
+    "profit_loss_account_reserve",
+    "shareholder_funds",
+    "turnover_gross_operating_revenue",
+    "other_operating_income",
+    "cost_sales",
+    "gross_profit_loss",
+    "administrative_expenses",
+    "raw_materials_consumables",
+    "staff_costs",
+    "depreciation_other_amounts_written_off_tangible_intangible_fixed_assets",
+    "other_operating_charges_format2",
+    "operating_profit_loss",
+    "profit_loss_on_ordinary_activities_before_tax",
+    "tax_on_profit_or_loss_on_ordinary_activities",
+    "profit_loss_for_period",
+}
+# The remaining columns are treated as strings.
+STRING_COLS = set(TARGET_COLS) - DATE_COLS - BOOL_COLS - NUMERIC_COLS
 
 # -----------------------------
-# Utilities
+# Small utils
 # -----------------------------
-
 def dedupe_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Drop duplicate-named columns, keeping the first occurrence.
-    This prevents df['col'] from returning a DataFrame when headers repeat.
-    """
     if df.columns.duplicated().any():
         df = df.loc[:, ~df.columns.duplicated()].copy()
     return df
 
-
 def series_or_first(df: pd.DataFrame, name: str) -> pd.Series:
-    """
-    Return a Series for column `name` even if duplicates exist.
-    If duplicates exist and df[name] is a DataFrame, take the first column.
-    """
     obj = df[name]
     if isinstance(obj, pd.DataFrame):
         return obj.iloc[:, 0]
     return obj
 
-
 # -----------------------------
 # SQL helpers
 # -----------------------------
-
 def build_engine(*, engine_url: Optional[str], odbc_connect: Optional[str]) -> Engine:
     if not engine_url and not odbc_connect:
         engine_url = os.getenv("AZURE_SQL_URL")
@@ -73,76 +145,30 @@ def build_engine(*, engine_url: Optional[str], odbc_connect: Optional[str]) -> E
         engine_url = "mssql+pyodbc:///?odbc_connect=" + urllib.parse.quote_plus(odbc_connect)
     return create_engine(engine_url, fast_executemany=True, future=True)
 
-
-def infer_staging_dtypes(df: pd.DataFrame):
-    from sqlalchemy import types as T
-    d = {}
-    for c, t in df.dtypes.items():
-        if pd.api.types.is_datetime64_any_dtype(t):
-            d[c] = T.Date()
-        elif pd.api.types.is_object_dtype(t):
-            d[c] = T.NVARCHAR(length=None)  # NVARCHAR(MAX)
-        else:
-            d[c] = T.NVARCHAR(length=None)
-    return d
-
-
 def to_sql_append(df: pd.DataFrame, engine: Engine, table: str, schema: str = "dbo", chunksize: int = 1000) -> int:
     if df.empty:
         return 0
-    df = df.rename(columns={c: c.strip().replace(" ", "_") for c in df.columns})
     df.to_sql(
         name=table,
         con=engine,
         schema=schema,
         if_exists="append",
         index=False,
-        dtype=infer_staging_dtypes(df),
         chunksize=chunksize,
         method=None,
     )
     return len(df)
 
-
 def get_table_columns(engine: Engine, schema: str, table: str) -> List[str]:
     insp = inspect(engine)
-    cols = [c["name"] for c in insp.get_columns(table, schema=schema)]
-    return cols
-
-
-def align_df_to_table(df: pd.DataFrame, table_columns: Sequence[str]) -> pd.DataFrame:
-    cols_set = set(table_columns)
-
-    # If both company_number and companies_house_registered_number exist,
-    # prefer companies_house_registered_number (drop duplicate).
-    if "company_number" in df.columns and "companies_house_registered_number" in df.columns:
-        # Drop the plain company_number to avoid duplicates
-        df = df.drop(columns=["company_number"])
-
-    # If only company_number exists but the table expects companies_house_registered_number, rename
-    elif "company_number" in df.columns and "companies_house_registered_number" in cols_set:
-        df = df.rename(columns={"company_number": "companies_house_registered_number"})
-
-    # Normalise company_number style columns if present
-    for cname in ("companies_house_registered_number", "company_number"):
-        if cname in df.columns:
-            df[cname] = df[cname].astype(str).str.replace(" ", "", regex=False)
-
-    # Keep only the columns the table actually has
-    keep = [c for c in df.columns if c in cols_set]
-    filtered = df[keep].copy()
-
-    return filtered
-
+    return [c["name"] for c in insp.get_columns(table, schema=schema)]
 
 # -----------------------------
 # Month selection helpers
 # -----------------------------
-
 def parse_yyyy_mm(s: str) -> date:
     y, m = s.split("-", 1)
     return date(int(y), int(m), 1)
-
 
 def month_iter_inclusive(start_ym: str, end_ym: str) -> Iterable[str]:
     cur = parse_yyyy_mm(start_ym)
@@ -154,13 +180,10 @@ def month_iter_inclusive(start_ym: str, end_ym: str) -> Iterable[str]:
             y, m = y + 1, 1
         cur = date(y, m, 1)
 
-
 def months_from_list(csv: str) -> List[str]:
     return [x.strip() for x in csv.split(",") if x.strip()]
 
-
 def default_since_months(n: int) -> List[str]:
-    # current month back N-1 months
     today = datetime.now(timezone.utc).date().replace(day=1)
     out = []
     y, m = today.year, today.month
@@ -171,36 +194,26 @@ def default_since_months(n: int) -> List[str]:
             y, m = y - 1, 12
     return out
 
-
 # -----------------------------
 # Download & parse the monthly ZIP
 # -----------------------------
-
 def month_name_en(ym: str) -> str:
     import calendar
     dt = parse_yyyy_mm(ym)
-    return calendar.month_name[dt.month]  # 'January', 'February', ...
-
+    return calendar.month_name[dt.month]  # 'January', ...
 
 def candidate_urls_for_month(ym: str) -> List[str]:
-    """Return URL candidates from newest to oldest locations."""
     y = parse_yyyy_mm(ym).year
     mon = month_name_en(ym)
     live = f"https://download.companieshouse.gov.uk/Accounts_Monthly_Data-{mon}{y}.zip"
     archive = f"https://download.companieshouse.gov.uk/archive/Accounts_Monthly_Data-{mon}{y}.zip"
-
     urls = [live, archive]
-
-    # Special case for 2008/2009 yearly bundles
     if y in (2008, 2009):
         urls.append(f"https://download.companieshouse.gov.uk/archive/Accounts_Monthly_Data-JanuaryToDecember{y}.zip")
-
     return urls
 
-
-def fetch_month_zip_as_df(yyyy_mm: str, timeout: float = 180.0) -> pd.DataFrame:
+def fetch_month_zip_as_df(yyyy_mm: str, timeout: float = 180.0) -> tuple[pd.DataFrame, str]:
     from stream_read_xbrl import stream_read_xbrl_zip
-
     last_err: Optional[Exception] = None
     for url in candidate_urls_for_month(yyyy_mm):
         print(f"Fetching month: {yyyy_mm} -> {url}")
@@ -209,7 +222,8 @@ def fetch_month_zip_as_df(yyyy_mm: str, timeout: float = 180.0) -> pd.DataFrame:
                 r.raise_for_status()
                 with stream_read_xbrl_zip(r.iter_bytes()) as (columns, rows):
                     data = [[("" if v is None else str(v)) for v in row] for row in rows]
-            return dedupe_columns(pd.DataFrame(data, columns=columns))
+            df = dedupe_columns(pd.DataFrame(data, columns=columns))
+            return df, url
         except httpx.HTTPStatusError as e:
             if e.response is not None and e.response.status_code == 404:
                 print(f"No monthly file at {url} (404). Trying next candidate…")
@@ -219,45 +233,95 @@ def fetch_month_zip_as_df(yyyy_mm: str, timeout: float = 180.0) -> pd.DataFrame:
         except Exception as e:
             last_err = e
             break
-
     if last_err:
         raise last_err
     raise FileNotFoundError(f"No URL worked for {yyyy_mm}")
 
-
 # -----------------------------
-# Normalisation
+# Normalisation / sanitisation
 # -----------------------------
-
 def normalise_columns(df: pd.DataFrame) -> pd.DataFrame:
     df = dedupe_columns(df)
 
-    # Canonical company_number (from CH registered number)
+    # Canonical company_number from CH registered number
     if "companies_house_registered_number" in df.columns:
         s = series_or_first(df, "companies_house_registered_number")
-        df["company_number"] = s.astype(str).str.replace(" ", "", regex=False)
+        df["companies_house_registered_number"] = s.astype(str).str.replace(" ", "", regex=False)
 
-    # Canonicalise 'period_end'
+    # Canonicalise period_end column name
     for cand in ("period_end", "balance_sheet_date", "date_end", "yearEnd"):
         if cand in df.columns:
             if cand != "period_end":
                 df = df.rename(columns={cand: "period_end"})
             break
 
-    if "period_end" in df.columns:
-        s = series_or_first(df, "period_end")
-        df["period_end"] = pd.to_datetime(s, errors="coerce").dt.date
+    # Parse dates if present (we'll re-coerce later as well)
+    for col in ("date", "balance_sheet_date", "period_start", "period_end"):
+        if col in df.columns:
+            s = series_or_first(df, col)
+            df[col] = pd.to_datetime(s, errors="coerce").dt.date
 
     return df
 
+def align_df_to_target(df: pd.DataFrame) -> pd.DataFrame:
+    # Keep only the columns that exist in TARGET_COLS (plus add any missing)
+    keep = [c for c in df.columns if c in TARGET_COLS]
+    out = df[keep].copy()
+    for col in TARGET_COLS:
+        if col not in out.columns:
+            out[col] = pd.NA
+    # Reorder
+    out = out[TARGET_COLS]
+    return out
+
+def coerce_bool(series: pd.Series) -> pd.Series:
+    # Accept True/False, 'true'/'false', '1'/'0', '' -> NA
+    s = series.astype(str).str.strip().str.lower()
+    mapped = s.map({"true": 1, "false": 0, "1": 1, "0": 0, "": pd.NA})
+    # if something else slips through, set NA
+    mapped = mapped.where(mapped.isin([0, 1]) | mapped.isna(), other=pd.NA)
+    return mapped.astype("Int64")
+
+def sanitise_for_schema(df: pd.DataFrame, zip_url: str) -> pd.DataFrame:
+    # 1) Ensure string columns are strings (but keep NA as NA)
+    for col in STRING_COLS:
+        if col in df.columns:
+            df[col] = df[col].astype("string")
+
+    # 2) Dates -> datetime.date (NaT -> NA)
+    for col in DATE_COLS:
+        if col in df.columns:
+            df[col] = pd.to_datetime(df[col], errors="coerce").dt.date
+
+    # 3) Bools -> 0/1 (nullable Int64 so NULLs stay NULL)
+    for col in BOOL_COLS:
+        if col in df.columns:
+            df[col] = coerce_bool(df[col])
+
+    # 4) Numeric -> to_numeric ('' -> NaN -> NULL)
+    for col in NUMERIC_COLS:
+        if col in df.columns:
+            # first, treat empty strings and blanks as NA
+            df[col] = df[col].replace({"": pd.NA, " ": pd.NA})
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    # 5) Companies number: strip spaces again for safety
+    if "companies_house_registered_number" in df.columns:
+        s = df["companies_house_registered_number"].astype("string")
+        df["companies_house_registered_number"] = s.str.replace(" ", "", regex=False)
+
+    # 6) Add/overwrite zip_url and ensure error exists
+    df["zip_url"] = zip_url
+    if "error" not in df.columns:
+        df["error"] = pd.NA
+
+    return df
 
 # -----------------------------
 # Main
 # -----------------------------
-
 def main() -> int:
     ap = argparse.ArgumentParser(description="Ingest MONTHLY iXBRL zips into Azure SQL.")
-    # Range / list / lookback
     ap.add_argument("--start-month", help="YYYY-MM start (inclusive).")
     ap.add_argument("--end-month", help="YYYY-MM end (inclusive).")
     ap.add_argument("--months", help="Comma-separated YYYY-MM list (e.g. 2024-01,2024-02).")
@@ -266,9 +330,9 @@ def main() -> int:
     ap.add_argument("--engine-url")
     ap.add_argument("--odbc-connect")
     ap.add_argument("--schema", default="dbo")
-    ap.add_argument("--target-table", default="financials", help="Final table (default: financials)")
+    ap.add_argument("--target-table", default="financials")
     ap.add_argument("--timeout", type=float, default=180.0)
-    ap.add_argument("--append-retries", type=int, default=5, help="Retries for SQL append on transient errors.")
+    ap.add_argument("--append-retries", type=int, default=5)
 
     args = ap.parse_args()
 
@@ -289,13 +353,13 @@ def main() -> int:
         print(f"ERROR building engine: {e}")
         return 1
 
-    # Determine target table columns once
+    # Optionally verify table exists and (soft) matches columns
     try:
-        target_cols = get_table_columns(engine, args.schema, args.target_table)
-        if not target_cols:
+        existing_cols = get_table_columns(engine, args.schema, args.target_table)
+        if not existing_cols:
             print(f"ERROR: target table {args.schema}.{args.target_table} not found or has no columns.")
             return 1
-        print(f"Detected {args.schema}.{args.target_table} columns: {len(target_cols)}")
+        print(f"Detected {args.schema}.{args.target_table} columns: {len(existing_cols)}")
     except Exception as e:
         print(f"ERROR inspecting {args.schema}.{args.target_table}: {e}")
         return 1
@@ -303,34 +367,37 @@ def main() -> int:
     wrote_any = False
 
     for ym in months:
-        # 1) Fetch & parse
+        # 1) Fetch & parse (and remember which URL worked)
         try:
-            df = fetch_month_zip_as_df(ym, timeout=args.timeout)
-        except httpx.HTTPStatusError as e:
-            print(f"HTTP error for {ym}: {e}")
-            return 1
+            df_raw, url_used = fetch_month_zip_as_df(ym, timeout=args.timeout)
         except Exception as e:
-            print(f"Unexpected fetch/parse error for {ym}: {e}")
+            print(f"Fetch/parse error for {ym}: {e}")
             return 1
 
-        if df.empty:
+        if df_raw.empty:
             print(f"{ym}: parsed 0 rows. Skipping.")
             continue
 
-        # 2) Normalise
-        df = normalise_columns(df)
+        # 2) Normalise raw -> tidy
+        df_norm = normalise_columns(df_raw)
 
-        # 3) Align to target table columns
-        df_aligned = align_df_to_table(df, target_cols)
-        if df_aligned.empty:
-            print(f"{ym}: no overlapping columns with {args.schema}.{args.target_table}. Skipping.")
+        # 3) Align to target schema and add missing columns
+        df_aligned = align_df_to_target(df_norm)
+
+        # 4) Final sanitation for SQL types & provenance
+        df_final = sanitise_for_schema(df_aligned, zip_url=url_used)
+
+        if df_final.empty:
+            print(f"{ym}: nothing to append after alignment/sanitisation. Skipping.")
             continue
 
-        # 4) Append with retries (handles intermittent SQL connectivity)
+        # 5) Append with retries
         last_err: Optional[Exception] = None
         for attempt in range(1, args.append_retries + 1):
             try:
-                rows = to_sql_append(df_aligned, engine, table=args.target_table, schema=args.schema, chunksize=1000)
+                rows = to_sql_append(
+                    df_final, engine, table=args.target_table, schema=args.schema, chunksize=1000
+                )
                 print(f"✅ {ym}: appended {rows} rows into {args.schema}.{args.target_table}.")
                 wrote_any = True
                 last_err = None
@@ -351,7 +418,6 @@ def main() -> int:
     if not wrote_any:
         print("Nothing ingested (no files or all empty).")
     return 0
-
 
 if __name__ == "__main__":
     raise SystemExit(main())
