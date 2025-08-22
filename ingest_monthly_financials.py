@@ -169,64 +169,62 @@ def month_name_en(ym: str) -> str:
     dt = parse_yyyy_mm(ym)
     return calendar.month_name[dt.month]
 
-def candidate_urls_for_month(ym: str) -> List[str]:
+def candidate_urls_for_month(ym: str) -> list[str]:
+    """Prefer LIVE monthly URL, then fall back to ARCHIVE, then 2008/2009 yearly bundle."""
     y = parse_yyyy_mm(ym).year
-    mon = month_name_en(ym)
-    return [
-        f"https://download.companieshouse.gov.uk/Accounts_Monthly_Data-{mon}{y}.zip",
-        f"https://download.companieshouse.gov.uk/archive/Accounts_Monthly_Data-{mon}{y}.zip",
-    ] + ([f"https://download.companieshouse.gov.uk/archive/Accounts_Monthly_Data-JanuaryToDecember{y}.zip"]
-         if y in (2008, 2009) else [])
+    mon = month_name_en(ym)  # e.g. 'January'
+    live = f"https://download.companieshouse.gov.uk/Accounts_Monthly_Data-{mon}{y}.zip"
+    archive = f"https://download.companieshouse.gov.uk/archive/Accounts_Monthly_Data-{mon}{y}.zip"
 
-@dataclass
-class DownloadResult:
-    columns: List[str]
-    rows: Iterable[Iterable[object]]
-    url: str
+    urls = [live, archive]
+    if y in (2008, 2009):
+        urls.append(
+            f"https://download.companieshouse.gov.uk/archive/Accounts_Monthly_Data-JanuaryToDecember{y}.zip"
+        )
+    return urls
 
-def fetch_month_zip_as_rows(yyyy_mm: str, timeout: float = 180.0, max_attempts: int = 5) -> DownloadResult:
-    """
-    Stream download with retry + size validation. Parses with stream_read_xbrl_zip.
-    """
+
+def fetch_month_zip_as_df(yyyy_mm: str, timeout: float = 180.0, per_url_retries: int = 3) -> pd.DataFrame:
     from stream_read_xbrl import stream_read_xbrl_zip
-
-    last_err: Optional[Exception] = None
+    import time
+    last_err: Exception | None = None
 
     for url in candidate_urls_for_month(yyyy_mm):
-        for attempt in range(1, max_attempts + 1):
+        for attempt in range(1, per_url_retries + 1):
             try:
+                print(f"Fetching month: {yyyy_mm} -> {url} (attempt {attempt}/{per_url_retries})")
                 with httpx.stream("GET", url, timeout=timeout, follow_redirects=True) as r:
                     r.raise_for_status()
-                    expected = int(r.headers.get("Content-Length") or 0)
-
-                    # stream_read_xbrl_zip can consume an iterator of bytes
-                    total = 0
-                    def gen():
-                        nonlocal total
-                        for chunk in r.iter_bytes():
-                            total += len(chunk)
-                            yield chunk
-
-                    with stream_read_xbrl_zip(gen()) as (columns, rows):
-                        if expected and total != expected:
-                            raise IOError(f"incomplete download: got {total} bytes, expected {expected}")
-                        return DownloadResult(columns=list(columns), rows=rows, url=url)
+                    with stream_read_xbrl_zip(r.iter_bytes()) as (columns, rows):
+                        data = [[("" if v is None else str(v)) for v in row] for row in rows]
+                return dedupe_columns(pd.DataFrame(data, columns=columns))
 
             except httpx.HTTPStatusError as e:
+                # If it's a 404, move on to the next candidate URL immediately
                 if e.response is not None and e.response.status_code == 404:
-                    # try next candidate URL
+                    print(f"No monthly file at {url} (404). Trying next candidate…")
                     last_err = e
-                    break
+                    break  # break retry loop -> next URL
                 last_err = e
+                print(f"HTTP error at {url}: {e}.")
+                # small backoff then retry same URL
+                if attempt < per_url_retries:
+                    time.sleep(2 * attempt)
+
+            except (httpx.ReadError, httpx.RemoteProtocolError, httpx.ConnectError) as e:
+                # transient network issue; retry same URL
+                last_err = e
+                print(f"Network error at {url}: {e} — retrying…")
+                if attempt < per_url_retries:
+                    time.sleep(3 * attempt)
+
             except Exception as e:
+                # parsing or other error; try next URL
                 last_err = e
+                print(f"Parse error at {url}: {e} — trying next candidate.")
+                break
 
-            # brief backoff
-            time.sleep(min(10, 2 * attempt))
-
-    if last_err:
-        raise last_err
-    raise FileNotFoundError(f"No URL worked for {yyyy_mm}")
+    raise RuntimeError(f"{yyyy_mm}: all URL candidates failed. Last error: {last_err}")
 
 # -----------------------------
 # DataFrame shaping
