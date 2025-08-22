@@ -6,3 +6,4 @@ python-dateutil
 sqlalchemy>=2
 pyodbc
 stream-read-xbrl
+requests
