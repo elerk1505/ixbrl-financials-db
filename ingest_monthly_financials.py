@@ -1,456 +1,555 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
 """
-Ingest Companies House monthly iXBRL into Azure SQL.
+Companies House iXBRL monthly -> Azure SQL (robust: stage + merge + retries + rollback)
 
 Usage examples:
-  python ingest_monthly_financials.py --start-month 2025-01 --end-month 2025-06 \
-      --odbc-connect "DRIVER={ODBC Driver 18 for SQL Server};SERVER=...;DATABASE=...;UID=...;PWD=...;Encrypt=yes;TrustServerCertificate=no;Connection Timeout=45;ConnectRetryCount=3;ConnectRetryInterval=10" \
-      --schema dbo --target-table financials
+  python ingest_monthly_financials.py --since-months 1 --odbc-connect "DRIVER=...;SERVER=...;DATABASE=...;UID=...;PWD=..."
+  python ingest_monthly_financials.py --start-month 2025-01 --end-month 2025-06 --odbc-connect "<your odbc>"
 
-  # Or "last N months"
-  python ingest_monthly_financials.py --since-months 6 --odbc-connect "..." --schema dbo --target-table financials
+What this script does:
+  1) For each month, download the official iXBRL monthly ZIP (live, then archive fallback).
+  2) Stream-parse rows with `stream_read_xbrl_zip` (no files saved).
+  3) Stage rows into [schema].[financials_stage] (ALL columns NULLable).
+  4) Upsert into [schema].[financials] using MERGE on (companies_house_registered_number, date).
+  5) Cleans stage and moves to next month. Retries transient failures with rollback.
+
+Safe defaults:
+  - All stage columns NVARCHAR(MAX) NULL so stage never fails on missing data.
+  - We coerce empty strings -> NULL before staging.
+  - DB ops use retries + explicit rollback on any error.
+
+Primary key assumption for MERGE:
+  (companies_house_registered_number, date)
+If your target PK differs, adjust MERGE ON accordingly.
 """
+
 from __future__ import annotations
 
 import argparse
 import calendar
 import contextlib
-import datetime as dt
-import io
 import os
-import re
 import sys
 import time
-import zipfile
-from typing import Dict, Iterable, List, Optional, Tuple
+from datetime import date, datetime, timezone
+from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 
-import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
-
-import pyodbc
-from sqlalchemy import create_engine, text
+import httpx
+from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.engine import Engine
+from sqlalchemy.exc import SQLAlchemyError
 
-# ----------------------------
-# Helpers: months & URLs
-# ----------------------------
+# Optional (used only for a tiny helper; feel free to remove pandas if you prefer)
+try:
+    import pandas as pd  # noqa: F401
+except Exception:  # pragma: no cover
+    pd = None  # type: ignore
 
-def month_range(start_ym: str, end_ym: str) -> List[str]:
-    ys, ms = map(int, start_ym.split("-"))
-    ye, me = map(int, end_ym.split("-"))
-    d = dt.date(ys, ms, 1)
-    out = []
-    while (d.year, d.month) <= (ye, me):
-        out.append(f"{d.year:04d}-{d.month:02d}")
-        d = (d.replace(day=28) + dt.timedelta(days=4)).replace(day=1)
-    return out
 
-def last_n_months(n: int) -> List[str]:
-    today = dt.date.today().replace(day=1)
-    months = []
-    for i in range(n):
-        d = (today - dt.timedelta(days=1)).replace(day=1) if i == 0 else (dt.date.fromordinal((months[-1] and dt.date.fromisoformat(months[-1]+"-01")).toordinal()) - dt.timedelta(days=1)).replace(day=1)
-        if i == 0:
-            d = today
-        months.append(f"{d.year:04d}-{d.month:02d}")
-        today = (today - dt.timedelta(days=1)).replace(day=1)
-    return sorted(set(months))
+# ---------- Configuration ----------
 
-def month_to_urls(ym: str) -> List[str]:
-    y, m = map(int, ym.split("-"))
-    mon = calendar.month_name[m]
-    base = f"Accounts_Monthly_Data-{mon}{y}.zip"
-    return [
-        f"https://download.companieshouse.gov.uk/{base}",
-        f"https://download.companieshouse.gov.uk/archive/{base}",
-    ]
-
-# ----------------------------
-# Robust HTTP client
-# ----------------------------
-
-def make_session() -> requests.Session:
-    s = requests.Session()
-    retries = Retry(
-        total=5,
-        connect=5,
-        read=5,
-        backoff_factor=1.5,
-        status_forcelist=(500, 502, 503, 504),
-        allowed_methods=frozenset(["GET"]),
-        raise_on_status=False,
-    )
-    s.mount("https://", HTTPAdapter(max_retries=retries))
-    s.headers.update({"User-Agent": "ixbrl-ingest/1.0"})
-    return s
-
-def download_zip_with_checks(session: requests.Session, url: str, max_attempts: int = 5, timeout: int = 60) -> Optional[bytes]:
-    for attempt in range(1, max_attempts + 1):
-        try:
-            r = session.get(url, stream=True, timeout=timeout)
-            # If it truly is a 404, no point retrying this URL.
-            if r.status_code == 404:
-                return None
-            r.raise_for_status()
-            expected = r.headers.get("Content-Length")
-            expected_size = int(expected) if (expected and expected.isdigit()) else None
-
-            buf = io.BytesIO()
-            for chunk in r.iter_content(chunk_size=1024 * 1024):
-                if not chunk:
-                    continue
-                buf.write(chunk)
-
-            data = buf.getvalue()
-            if expected_size is not None and len(data) != expected_size:
-                raise IOError(f"incomplete body: got {len(data)} expected {expected_size}")
-
-            # sanity: ensure it’s a valid zip file
-            with zipfile.ZipFile(io.BytesIO(data)) as z:
-                z.testzip()  # raises if corrupt
-            return data
-        except requests.HTTPError as e:
-            print(f"    fetch attempt {attempt}/{max_attempts} failed: HTTP {e.response.status_code}", flush=True)
-            if e.response is not None and e.response.status_code == 404:
-                return None
-        except Exception as e:
-            print(f"    fetch attempt {attempt}/{max_attempts} failed: {e}", flush=True)
-            time.sleep(min(10, attempt * 2))
-    return None
-
-# ----------------------------
-# iXBRL parsing
-# ----------------------------
-
-IX_NAMES = [
-    # Common tags across UK-GAAP / IFRS
-    # Add more as needed; unknown tags will be ignored gracefully.
-    "uk-gaap:TurnoverGrossOperatingRevenue",
-    "uk-gaap:GrossProfitLoss",
-    "uk-gaap:OperatingProfitLoss",
-    "uk-gaap:ProfitLossForPeriod",
-    "uk-gaap:AverageNumberEmployeesDuringPeriod",
-    "uk-gaap:NetAssetsLiabilitiesIncludingPensionAssetLiability",
-    "uk-gaap:TotalAssetsLessCurrentLiabilities",
-    "uk-gaap:CashBankOnHand",
-    "uk-gaap:CurrentAssets",
-    "uk-gaap:CreditorsDueWithinOneYear",
-    "uk-gaap:CreditorsDueAfterOneYear",
-    "ifrs-full:Revenue",
-    "ifrs-full:ProfitLoss",
-    "ifrs-full:CashAndCashEquivalents",
-    "ifrs-full:AverageNumberOfEmployeesDuringThePeriod",
-    "ifrs-full:TotalAssets",
-    "ifrs-full:Liabilities",
-    "ifrs-full:Equity",
+# The final table column order (as you confirmed)
+FINAL_COLS: List[str] = [
+    "run_code",
+    "company_id",
+    "date",
+    "file_type",
+    "taxonomy",
+    "balance_sheet_date",
+    "companies_house_registered_number",
+    "entity_current_legal_name",
+    "company_dormant",
+    "average_number_employees_during_period",
+    "period_start",
+    "period_end",
+    "tangible_fixed_assets",
+    "debtors",
+    "cash_bank_in_hand",
+    "current_assets",
+    "creditors_due_within_one_year",
+    "creditors_due_after_one_year",
+    "net_current_assets_liabilities",
+    "total_assets_less_current_liabilities",
+    "net_assets_liabilities_including_pension_asset_liability",
+    "called_up_share_capital",
+    "profit_loss_account_reserve",
+    "shareholder_funds",
+    "turnover_gross_operating_revenue",
+    "other_operating_income",
+    "cost_sales",
+    "gross_profit_loss",
+    "administrative_expenses",
+    "raw_materials_consumables",
+    "staff_costs",
+    "depreciation_other_amounts_written_off_tangible_intangible_fixed_assets",
+    "other_operating_charges_format2",
+    "operating_profit_loss",
+    "profit_loss_on_ordinary_activities_before_tax",
+    "tax_on_profit_or_loss_on_ordinary_activities",
+    "profit_loss_for_period",
+    "error",
+    "zip_url",
 ]
 
-# simple regex on <ix:nonFraction ... name="xxx">123</ix:nonFraction>
-NONFRACTION_RE = re.compile(rb'<ix:nonFraction[^>]*\sname="([^"]+)"[^>]*>(.*?)</ix:nonFraction>', re.I | re.S)
-STRING_RE = re.compile(rb'<ix:nonNumeric[^>]*\sname="([^"]+)"[^>]*>(.*?)</ix:nonNumeric>', re.I | re.S)
+# Staging table name (in the same schema as the target)
+DEFAULT_STAGE = "financials_stage"
 
-def parse_ixbrl_html(html_bytes: bytes) -> Dict[str, Optional[str]]:
-    """Return a dict of field -> value for selected IX_NAMES plus a couple of headings if present."""
-    # Extract values
-    out: Dict[str, Optional[str]] = {}
-    for m in NONFRACTION_RE.finditer(html_bytes):
-        name = m.group(1).decode(errors="ignore")
-        if name in IX_NAMES:
-            # strip tags within value
-            raw = m.group(2)
-            text = re.sub(rb"<[^>]+>", b"", raw).strip().decode(errors="ignore")
-            out[name] = text
-    # Some nonNumeric strings (entity name etc.) – heuristic, optional
-    for m in STRING_RE.finditer(html_bytes):
-        name = m.group(1).decode(errors="ignore")
-        if name.lower().endswith(("entitycurrentlegalname", "companieshouseregisterednumber")):
-            raw = m.group(2)
-            text = re.sub(rb"<[^>]+>", b"", raw).strip().decode(errors="ignore")
-            out[name] = text
-    return out
+# Retries
+HTTP_RETRIES = 5
+HTTP_RETRY_SLEEP = 6
+SQL_RETRIES = 4
+SQL_RETRY_SLEEP = 6
 
-def rows_from_zip(data: bytes, ym: str, zip_url: str) -> List[Dict[str, Optional[str]]]:
-    rows: List[Dict[str, Optional[str]]] = []
-    with zipfile.ZipFile(io.BytesIO(data)) as z:
-        candidates = [n for n in z.namelist() if n.lower().endswith((".html", ".xhtml", ".htm"))]
-        for name in candidates:
-            with z.open(name) as f:
-                html = f.read()
-            fields = parse_ixbrl_html(html)
-            if not fields:
+BATCH_SIZE = 1000  # rows per executemany to stage
+
+
+# ---------- Helpers: dates & months ----------
+
+def parse_yyyy_mm(s: str) -> date:
+    y, m = s.split("-", 1)
+    return date(int(y), int(m), 1)
+
+
+def month_iter_inclusive(start_ym: str, end_ym: str) -> Iterable[str]:
+    cur = parse_yyyy_mm(start_ym)
+    end = parse_yyyy_mm(end_ym)
+    while cur <= end:
+        yield f"{cur.year:04d}-{cur.month:02d}"
+        y, m = cur.year, cur.month + 1
+        if m == 13:
+            y, m = y + 1, 1
+        cur = date(y, m, 1)
+
+
+def default_since_months(n: int) -> List[str]:
+    # current month back N-1 months
+    today = datetime.now(timezone.utc).date().replace(day=1)
+    out = []
+    y, m = today.year, today.month
+    for _ in range(n):
+        out.append(f"{y:04d}-{m:02d}")
+        m -= 1
+        if m == 0:
+            y, m = y - 1, 12
+    return list(reversed(out))
+
+
+def month_name_en(ym: str) -> str:
+    dt = parse_yyyy_mm(ym)
+    return calendar.month_name[dt.month]
+
+
+# ---------- Data source URLs ----------
+
+def candidate_urls_for_month(ym: str) -> List[str]:
+    """
+    Return URL candidates newest->older.
+    Official pattern:
+      Live    : https://download.companieshouse.gov.uk/Accounts_Monthly_Data-{Month}{YYYY}.zip
+      Archive : https://download.companieshouse.gov.uk/archive/Accounts_Monthly_Data-{Month}{YYYY}.zip
+      Special : JanuaryToDecember 2008/2009
+    """
+    y = parse_yyyy_mm(ym).year
+    mon = month_name_en(ym)
+
+    urls = [
+        f"https://download.companieshouse.gov.uk/Accounts_Monthly_Data-{mon}{y}.zip",
+        f"https://download.companieshouse.gov.uk/archive/Accounts_Monthly_Data-{mon}{y}.zip",
+    ]
+    if y in (2008, 2009):
+        urls.append(
+            f"https://download.companieshouse.gov.uk/archive/Accounts_Monthly_Data-JanuaryToDecember{y}.zip"
+        )
+    return urls
+
+
+# ---------- HTTP fetch & parse (streaming) ----------
+
+@contextlib.contextmanager
+def _http_stream(url: str, timeout: float = 180.0):
+    """
+    Stream an HTTP response with retries and content-length validation.
+    Yields a context whose .iter_bytes() can be passed to stream_read_xbrl_zip.
+    """
+    last_err: Optional[Exception] = None
+    for attempt in range(1, HTTP_RETRIES + 1):
+        try:
+            with httpx.stream("GET", url, timeout=timeout) as r:
+                r.raise_for_status()
+                expected = int(r.headers.get("Content-Length", "0") or "0")
+                # Wrap to count bytes we actually iterate (for validation)
+                total = 0
+
+                def gen() -> Iterator[bytes]:
+                    nonlocal total
+                    for chunk in r.iter_bytes():
+                        total += len(chunk)
+                        yield chunk
+
+                class _Wrapper:
+                    def iter_bytes(self) -> Iterator[bytes]:
+                        return gen()
+
+                wrapper = _Wrapper()
+                try:
+                    yield wrapper
+                finally:
+                    # Validate size if Content-Length was provided
+                    if expected and total != expected:
+                        raise IOError(
+                            f"incomplete body: got {total} expected {expected}"
+                        )
+                return
+        except Exception as e:
+            last_err = e
+            if attempt < HTTP_RETRIES:
+                print(f"  fetch attempt {attempt}/{HTTP_RETRIES} failed: {e}")
+                time.sleep(HTTP_RETRY_SLEEP)
                 continue
-            row = {
-                "run_code": ym.replace("-", ""),
-                "company_id": fields.get("CompaniesHouseRegisteredNumber") or fields.get("companieshouseregisterednumber"),
-                "date": ym + "-01",
-                "file_type": "ixbrl",
-                "taxonomy": None,
-                "balance_sheet_date": None,
-                "companies_house_registered_number": fields.get("CompaniesHouseRegisteredNumber") or fields.get("companieshouseregisterednumber"),
-                "entity_current_legal_name": fields.get("EntityCurrentLegalName") or fields.get("entitycurrentlegalname"),
-                "company_dormant": None,
-                "average_number_employees_during_period": fields.get("uk-gaap:AverageNumberEmployeesDuringPeriod") or fields.get("ifrs-full:AverageNumberOfEmployeesDuringThePeriod"),
-                "period_start": None,
-                "period_end": None,
-                "tangible_fixed_assets": None,
-                "debtors": None,
-                "cash_bank_in_hand": fields.get("uk-gaap:CashBankOnHand") or fields.get("ifrs-full:CashAndCashEquivalents"),
-                "current_assets": fields.get("uk-gaap:CurrentAssets"),
-                "creditors_due_within_one_year": fields.get("uk-gaap:CreditorsDueWithinOneYear"),
-                "creditors_due_after_one_year": fields.get("uk-gaap:CreditorsDueAfterOneYear"),
-                "net_current_assets_liabilities": None,
-                "total_assets_less_current_liabilities": fields.get("uk-gaap:TotalAssetsLessCurrentLiabilities"),
-                "net_assets_liabilities_including_pension_asset_liability": fields.get("uk-gaap:NetAssetsLiabilitiesIncludingPensionAssetLiability"),
-                "called_up_share_capital": None,
-                "profit_loss_account_reserve": None,
-                "shareholder_funds": None,
-                "turnover_gross_operating_revenue": fields.get("uk-gaap:TurnoverGrossOperatingRevenue") or fields.get("ifrs-full:Revenue"),
-                "other_operating_income": None,
-                "cost_sales": None,
-                "gross_profit_loss": fields.get("uk-gaap:GrossProfitLoss"),
-                "administrative_expenses": None,
-                "raw_materials_consumables": None,
-                "staff_costs": None,
-                "depreciation_other_amounts_written_off_tangible_intangible_fixed_assets": None,
-                "other_operating_charges_format2": None,
-                "operating_profit_loss": fields.get("uk-gaap:OperatingProfitLoss"),
-                "profit_loss_on_ordinary_activities_before_tax": None,
-                "tax_on_profit_or_loss_on_ordinary_activities": None,
-                "profit_loss_for_period": fields.get("uk-gaap:ProfitLossForPeriod") or fields.get("ifrs-full:ProfitLoss"),
-                "zip_url": zip_url,
-            }
-            rows.append(row)
-    return rows
+            raise
 
-# ----------------------------
-# SQL (create/merge) with robust error handling
-# ----------------------------
+    if last_err:
+        raise last_err
 
-STAGING_TABLE = "financials_stage"
 
-CREATE_STAGING_SQL = """
+def stream_rows_from_zip(url: str, timeout: float = 180.0) -> Tuple[List[str], Iterator[List[str]]]:
+    """
+    Returns (columns, iterator of row-lists as strings).
+    """
+    try:
+        from stream_read_xbrl import stream_read_xbrl_zip
+    except Exception as e:  # pragma: no cover
+        raise RuntimeError(
+            "Missing dependency 'stream-read-xbrl'. "
+            "Install with: pip install stream-read-xbrl"
+        ) from e
+
+    with _http_stream(url, timeout=timeout) as wrapper:
+        # stream_read_xbrl_zip expects an iterator of bytes; pass wrapper.iter_bytes()
+        with stream_read_xbrl_zip(wrapper.iter_bytes()) as (columns, rows):
+            # Normalise column names to exact strings (no spaces trimmed here; we map later)
+            return list(columns), rows
+
+
+# ---------- SQL / Engine ----------
+
+def build_engine(*, engine_url: Optional[str], odbc_connect: Optional[str]) -> Engine:
+    if not engine_url and not odbc_connect:
+        engine_url = os.getenv("AZURE_SQL_URL")
+        odbc_connect = os.getenv("AZURE_SQL_ODBC")
+    if not engine_url and not odbc_connect:
+        raise RuntimeError(
+            "Provide --engine-url or --odbc-connect (or set AZURE_SQL_URL/AZURE_SQL_ODBC)."
+        )
+    if not engine_url:
+        import urllib.parse
+
+        engine_url = "mssql+pyodbc:///?odbc_connect=" + urllib.parse.quote_plus(odbc_connect)  # type: ignore[arg-type]
+    # fast_executemany will be enabled on the DBAPI cursor below
+    return create_engine(engine_url, future=True)
+
+
+def ensure_stage_table(engine: Engine, schema: str, stage_table: str):
+    """
+    Create stage table if it doesn't exist.
+    ALL COLUMNS NULLABLE NVARCHAR(MAX) so staging never fails on NULLs.
+    """
+    col_defs = ",\n".join(f"[{c}] NVARCHAR(MAX) NULL" for c in FINAL_COLS)
+    sql = f"""
 IF NOT EXISTS (
-    SELECT 1 FROM sys.tables t
+    SELECT 1
+    FROM sys.tables t
     JOIN sys.schemas s ON s.schema_id = t.schema_id
-    WHERE s.name = :schema AND t.name = :table
+    WHERE s.name = :schema AND t.name = :stage
 )
 BEGIN
-    EXEC('CREATE TABLE [' + :schema + '].[' + :table + '] (
-        [run_code] NVARCHAR(32) NULL,
-        [company_id] NVARCHAR(64) NULL,
-        [date] DATE NULL,
-        [file_type] NVARCHAR(32) NULL,
-        [taxonomy] NVARCHAR(128) NULL,
-        [balance_sheet_date] DATE NULL,
-        [companies_house_registered_number] NVARCHAR(64) NULL,
-        [entity_current_legal_name] NVARCHAR(512) NULL,
-        [company_dormant] NVARCHAR(32) NULL,
-        [average_number_employees_during_period] NVARCHAR(64) NULL,
-        [period_start] DATE NULL,
-        [period_end] DATE NULL,
-        [tangible_fixed_assets] NVARCHAR(64) NULL,
-        [debtors] NVARCHAR(64) NULL,
-        [cash_bank_in_hand] NVARCHAR(64) NULL,
-        [current_assets] NVARCHAR(64) NULL,
-        [creditors_due_within_one_year] NVARCHAR(64) NULL,
-        [creditors_due_after_one_year] NVARCHAR(64) NULL,
-        [net_current_assets_liabilities] NVARCHAR(64) NULL,
-        [total_assets_less_current_liabilities] NVARCHAR(64) NULL,
-        [net_assets_liabilities_including_pension_asset_liability] NVARCHAR(64) NULL,
-        [called_up_share_capital] NVARCHAR(64) NULL,
-        [profit_loss_account_reserve] NVARCHAR(64) NULL,
-        [shareholder_funds] NVARCHAR(64) NULL,
-        [turnover_gross_operating_revenue] NVARCHAR(64) NULL,
-        [other_operating_income] NVARCHAR(64) NULL,
-        [cost_sales] NVARCHAR(64) NULL,
-        [gross_profit_loss] NVARCHAR(64) NULL,
-        [administrative_expenses] NVARCHAR(64) NULL,
-        [raw_materials_consumables] NVARCHAR(64) NULL,
-        [staff_costs] NVARCHAR(64) NULL,
-        [depreciation_other_amounts_written_off_tangible_intangible_fixed_assets] NVARCHAR(64) NULL,
-        [other_operating_charges_format2] NVARCHAR(64) NULL,
-        [operating_profit_loss] NVARCHAR(64) NULL,
-        [profit_loss_on_ordinary_activities_before_tax] NVARCHAR(64) NULL,
-        [tax_on_profit_or_loss_on_ordinary_activities] NVARCHAR(64) NULL,
-        [profit_loss_for_period] NVARCHAR(64) NULL,
-        [zip_url] NVARCHAR(1024) NULL
+    EXEC('CREATE TABLE [{schema}].[{stage}] (
+{col_defs}
     )');
 END
-"""
+""".replace(":schema", "'"+schema+"'").replace(":stage", "'"+stage_table+"'")
+    # (We pre-bind schema/stage above because we EXEC dynamic SQL)
+    with engine.begin() as conn:
+        conn.exec_driver_sql(sql)
 
-MERGE_SQL_TEMPLATE = """
--- simple upsert by (run_code, company_id, date)
-MERGE [{schema}].[{target}] AS T
-USING (SELECT * FROM [{schema}].[{stage}] WHERE run_code = :run_code) AS S
-ON (T.run_code = S.run_code AND ISNULL(T.company_id,'') = ISNULL(S.company_id,'') AND T.[date] = S.[date])
-WHEN MATCHED THEN UPDATE SET
-    {update_cols}
+
+def truncate_stage(engine: Engine, schema: str, stage_table: str):
+    with engine.begin() as conn:
+        conn.exec_driver_sql(f"TRUNCATE TABLE [{schema}].[{stage_table}]")
+
+
+def merge_stage_into_target(
+    engine: Engine,
+    schema: str,
+    stage_table: str,
+    target_table: str,
+) -> int:
+    """
+    Upsert from stage -> target using MERGE on (companies_house_registered_number, date).
+    Returns number of rows affected (inserted + updated).
+    """
+    set_cols = [c for c in FINAL_COLS if c not in ("companies_house_registered_number", "date")]
+    set_clause = ", ".join(f"t.[{c}] = s.[{c}]" for c in set_cols)
+
+    # Use a temp table to capture OUTPUT $action to count affected rows
+    sql = f"""
+DECLARE @changes TABLE (action NVARCHAR(10));
+MERGE [{schema}].[{target_table}] AS t
+USING (SELECT * FROM [{schema}].[{stage_table}]) AS s
+  ON t.[companies_house_registered_number] = s.[companies_house_registered_number]
+ AND t.[date] = s.[date]
+WHEN MATCHED THEN
+  UPDATE SET {set_clause}
 WHEN NOT MATCHED BY TARGET THEN
-    INSERT ({cols}) VALUES ({vals});
+  INSERT ({", ".join(f"[{c}]" for c in FINAL_COLS)})
+  VALUES ({", ".join("s.["+c+"]" for c in FINAL_COLS)})
+OUTPUT $action INTO @changes;
+SELECT COUNT(*) FROM @changes;
 """
-
-def create_engine_pyodbc(odbc_connect: str) -> Engine:
-    # TrustServerCertificate etc should be carried in odbc_connect provided by caller.
-    return create_engine(
-        f"mssql+pyodbc:///?odbc_connect={requests.utils.quote(odbc_connect)}",
-        fast_executemany=True,
-        pool_pre_ping=True,
-        pool_recycle=120,
-    )
-
-def ensure_staging(engine: Engine, schema: str, table: str) -> None:
     with engine.begin() as conn:
-        conn.execute(
-            text(CREATE_STAGING_SQL),
-            {"schema": schema, "table": table},
-        )
+        rows = conn.exec_driver_sql(sql).scalar_one()
+    return int(rows or 0)
 
-def clear_stage_for_run(engine: Engine, schema: str, table: str, run_code: str) -> None:
-    with engine.begin() as conn:
-        conn.execute(text(f"DELETE FROM [{schema}].[{table}] WHERE run_code = :rc"), {"rc": run_code})
 
-def bulk_stage_rows(engine: Engine, schema: str, table: str, rows: List[Dict[str, Optional[str]]]) -> None:
-    if not rows:
-        return
-    cols = list(rows[0].keys())
-    placeholders = ", ".join(["?"] * len(cols))
-    insert_sql = f"INSERT INTO [{schema}].[{table}] ({', '.join(f'[{c}]' for c in cols)}) VALUES ({placeholders})"
-    values = [[row.get(c) for c in cols] for row in rows]
+# ---------- Row shaping & staging ----------
 
-    # raw_connection to get cursor.executemany with robust rollback
-    attempts = 3
-    for attempt in range(1, attempts + 1):
-        conn = engine.raw_connection()
+def _normalize_value(v):
+    # Empty strings -> NULL
+    if v is None:
+        return None
+    if isinstance(v, str):
+        v = v.strip()
+        return v if v != "" else None
+    # Datetime/date -> ISO 8601 (SQL Server will cast NVARCHAR -> DATE/DATETIME)
+    if isinstance(v, (datetime, date)):
+        # Preserve full datetime if present
+        if isinstance(v, datetime):
+            return v.strftime("%Y-%m-%d %H:%M:%S")
+        return v.strftime("%Y-%m-%d")
+    # bool -> 0/1 string
+    if isinstance(v, bool):
+        return "1" if v else "0"
+    # else stringify to avoid cast issues in stage
+    return str(v)
+
+
+def _row_to_stage_list(in_cols: List[str], row: Sequence, zip_url: str) -> List[Optional[str]]:
+    """
+    Map the parsed row to the FINAL_COLS order, normalising values.
+    Unseen columns are NULL; we also ensure 'zip_url' is filled.
+    """
+    # Build a dict quickly
+    record: Dict[str, Optional[str]] = {}
+    for c, v in zip(in_cols, row):
+        record[c] = _normalize_value(v)
+
+    out: List[Optional[str]] = []
+    for col in FINAL_COLS:
+        if col == "zip_url":
+            out.append(zip_url)
+        else:
+            out.append(record.get(col))
+    return out
+
+
+def stage_rows(
+    engine: Engine,
+    schema: str,
+    stage_table: str,
+    in_cols: List[str],
+    rows_iter: Iterator[Sequence],
+    zip_url: str,
+) -> int:
+    """
+    Insert rows into stage table in batches using fast_executemany.
+    Returns number of staged rows.
+    """
+    raw = engine.raw_connection()
+    try:
+        cur = raw.cursor()
         try:
-            cur = conn.cursor()
-            cur.fast_executemany = True
-            cur.executemany(insert_sql, values)
-            conn.commit()
-            return
-        except pyodbc.OperationalError as e:
-            print(f"    stage insert attempt {attempt}/{attempts} failed: {e}", flush=True)
-            with contextlib.suppress(Exception):
-                conn.rollback()
-            if attempt == attempts:
-                raise
-            time.sleep(5)
-        finally:
-            with contextlib.suppress(Exception):
-                conn.close()
+            cur.fast_executemany = True  # pyodbc optimization
+        except Exception:
+            pass
 
-def merge_stage_into_target(engine: Engine, schema: str, stage: str, target: str, run_code: str) -> None:
-    # Build update and insert lists dynamically from stage table columns (same as row keys)
-    stage_cols = [
-        "run_code","company_id","date","file_type","taxonomy","balance_sheet_date",
-        "companies_house_registered_number","entity_current_legal_name","company_dormant",
-        "average_number_employees_during_period","period_start","period_end","tangible_fixed_assets",
-        "debtors","cash_bank_in_hand","current_assets","creditors_due_within_one_year",
-        "creditors_due_after_one_year","net_current_assets_liabilities","total_assets_less_current_liabilities",
-        "net_assets_liabilities_including_pension_asset_liability","called_up_share_capital",
-        "profit_loss_account_reserve","shareholder_funds","turnover_gross_operating_revenue",
-        "other_operating_income","cost_sales","gross_profit_loss","administrative_expenses",
-        "raw_materials_consumables","staff_costs",
-        "depreciation_other_amounts_written_off_tangible_intangible_fixed_assets",
-        "other_operating_charges_format2","operating_profit_loss",
-        "profit_loss_on_ordinary_activities_before_tax",
-        "tax_on_profit_or_loss_on_ordinary_activities","profit_loss_for_period","zip_url"
-    ]
-    cols_clause = ", ".join(f"[{c}]" for c in stage_cols)
-    vals_clause = ", ".join(f"S.[{c}]" for c in stage_cols)
-    update_cols = ", ".join(f"T.[{c}] = S.[{c}]" for c in stage_cols if c not in ("run_code","company_id","date"))
+        placeholders = ", ".join("?" for _ in FINAL_COLS)
+        insert_sql = f"INSERT INTO [{schema}].[{stage_table}] ({', '.join('['+c+']' for c in FINAL_COLS)}) VALUES ({placeholders})"
 
-    sql = MERGE_SQL_TEMPLATE.format(schema=schema, target=target, stage=stage, update_cols=update_cols, cols=cols_clause, vals=vals_clause)
-    with engine.begin() as conn:
-        # Ensure target exists (simple create if missing)
-        conn.execute(text(f"""
-IF NOT EXISTS (SELECT 1 FROM sys.tables t JOIN sys.schemas s ON s.schema_id = t.schema_id
-               WHERE s.name = :schema AND t.name = :target)
-BEGIN
-  SELECT TOP 0 * INTO [{schema}].[{target}] FROM [{schema}].[{stage}];
-END
-"""), {"schema": schema, "target": target})
-        conn.execute(text(sql), {"run_code": run_code})
+        batch: List[List[Optional[str]]] = []
+        total = 0
 
-# ----------------------------
-# Main
-# ----------------------------
+        def flush():
+            nonlocal total
+            if not batch:
+                return
+            for attempt in range(1, SQL_RETRIES + 1):
+                try:
+                    cur.executemany(insert_sql, batch)
+                    raw.commit()
+                    total += len(batch)
+                    batch.clear()
+                    return
+                except Exception as e:
+                    raw.rollback()
+                    if attempt == SQL_RETRIES:
+                        raise
+                    print(f"    stage executemany retry {attempt}/{SQL_RETRIES} after error: {e}")
+                    time.sleep(SQL_RETRY_SLEEP)
+
+        for row in rows_iter:
+            batch.append(_row_to_stage_list(in_cols, row, zip_url))
+            if len(batch) >= BATCH_SIZE:
+                flush()
+
+        flush()
+        return total
+    finally:
+        try:
+            raw.close()
+        except Exception:
+            pass
+
+
+# ---------- Main pipeline ----------
 
 def main() -> int:
-    ap = argparse.ArgumentParser()
-    g = ap.add_mutually_exclusive_group(required=True)
-    g.add_argument("--since-months", type=int)
-    g.add_argument("--start-month", type=str)
-    ap.add_argument("--end-month", type=str)
-    ap.add_argument("--odbc-connect", type=str, required=True)
-    ap.add_argument("--schema", type=str, default="dbo")
-    ap.add_argument("--target-table", type=str, required=True)
+    ap = argparse.ArgumentParser(description="Ingest Companies House iXBRL monthly zips into Azure SQL (stage+merge).")
+    # Month selection
+    ap.add_argument("--start-month")
+    ap.add_argument("--end-month")
+    ap.add_argument("--months", help="Comma-separated list, e.g. 2025-01,2025-02")
+    ap.add_argument("--since-months", type=int, default=1)
+    # SQL
+    ap.add_argument("--engine-url")
+    ap.add_argument("--odbc-connect")
+    ap.add_argument("--schema", default="dbo")
+    ap.add_argument("--target-table", default="financials")
+    ap.add_argument("--staging-table", default=DEFAULT_STAGE)
+    # Network / timeouts
+    ap.add_argument("--timeout", type=float, default=240.0)
+
     args = ap.parse_args()
 
-    if args.since_months is not None:
-        months = month_range(
-            (dt.date.today().replace(day=1) - dt.timedelta(days=30 * (args.since_months - 1))).strftime("%Y-%m"),
-            dt.date.today().strftime("%Y-%m"),
-        )
+    # Resolve months
+    if args.start_month and args.end_month:
+        months = list(month_iter_inclusive(args.start_month, args.end_month))
+    elif args.months:
+        months = [m.strip() for m in args.months.split(",") if m.strip()]
     else:
-        if not args.end_month:
-            ap.error("--end-month is required when using --start-month")
-        months = month_range(args.start_month, args.end_month)
+        months = default_since_months(args.since_months)
 
-    print(f"*** --schema {args.schema} --target-table {args.target_table}", flush=True)
-    print(f"Target months: {months}", flush=True)
+    print(f"*** --schema {args.schema} --target-table {args.target_table}")
+    print(f"Target months: {months}")
 
-    # SQL engine
-    engine = create_engine_pyodbc(args.odbc_connect)
-    ensure_staging(engine, args.schema, STAGING_TABLE)
+    # Engine / connection
+    try:
+        engine = build_engine(engine_url=args.engine_url, odbc_connect=args.odbc_connect)
+    except Exception as e:
+        print(f"ERROR: failed to build engine: {e}")
+        return 1
 
-    session = make_session()
-    total_rows = 0
+    # Ensure stage exists, and target table has expected columns
+    try:
+        ensure_stage_table(engine, args.schema, args.staging_table)
+        insp = inspect(engine)
+        tgt_cols = [c["name"] for c in insp.get_columns(args.target_table, schema=args.schema)]
+        missing = [c for c in FINAL_COLS if c not in tgt_cols]
+        if missing:
+            print(f"ERROR: target {args.schema}.{args.target_table} is missing columns: {missing}")
+            return 1
+    except Exception as e:
+        print(f"ERROR: schema inspection / ensure stage failed: {e}")
+        return 1
+
+    total_ingested = 0
 
     for ym in months:
-        urls = month_to_urls(ym)
-        print(f"Fetching month: {ym} -> {urls[0]}", flush=True)
+        # 1) Find a working URL
+        urls = candidate_urls_for_month(ym)
+        columns: Optional[List[str]] = None
+        rows_iter: Optional[Iterator[List[str]]] = None
+        chosen_url: Optional[str] = None
+        for url in urls:
+            print(f"Fetching month: {ym} -> {url}")
+            try:
+                columns, rows_iter = stream_rows_from_zip(url, timeout=args.timeout)
+                chosen_url = url
+                break
+            except httpx.HTTPStatusError as e:
+                if e.response.status_code == 404:
+                    print(f"  {ym}: 404 at {url}, trying next URL…")
+                    continue
+                print(f"  {ym}: fetch/parse error: {e}")
+                columns = None
+                rows_iter = None
+                break
+            except Exception as e:
+                print(f"  {ym}: fetch/parse error: {e}")
+                columns = None
+                rows_iter = None
+                break
 
-        data = download_zip_with_checks(session, urls[0])
-        if data is None:
-            print(f"  {ym}: trying next URL -> {urls[1]}", flush=True)
-            data = download_zip_with_checks(session, urls[1])
-
-        if data is None:
-            print(f"{ym}: no available monthly ZIP (skipping).", flush=True)
+        if not columns or rows_iter is None or chosen_url is None:
+            print(f"{ym}: no available monthly ZIP (skipping).")
             continue
 
+        # 2) Stage in batches with retries + rollback
+        # First clean stage for this month
         try:
-            rows = rows_from_zip(data, ym, urls[0])
-        except zipfile.BadZipFile:
-            # re-download if the body looked fine but zip is corrupt (rare)
-            print(f"{ym}: corrupt zip body, retrying alternate URL…", flush=True)
-            data = download_zip_with_checks(session, urls[1])
-            if not data:
-                print(f"{ym}: still corrupt or missing, skipping.", flush=True)
-                continue
-            rows = rows_from_zip(data, ym, urls[1])
-
-        if not rows:
-            print(f"{ym}: parsed 0 iXBRL rows (no ixbrl files or no matching tags), skipping.", flush=True)
-            continue
-
-        run_code = ym.replace("-", "")
-        print(f"{ym}: staging {len(rows)} rows…", flush=True)
-        # cleanup and stage
-        try:
-            clear_stage_for_run(engine, args.schema, STAGING_TABLE, run_code)
-            bulk_stage_rows(engine, args.schema, STAGING_TABLE, rows)
-            print(f"{ym}: merging to [{args.schema}].[{args.target_table}]…", flush=True)
-            merge_stage_into_target(engine, args.schema, STAGING_TABLE, args.target_table, run_code)
-            total_rows += len(rows)
+            truncate_stage(engine, args.schema, args.staging_table)
         except Exception as e:
-            # Ensure any broken transaction is rolled back; engine.begin() blocks already do this,
-            # but raw_connection inserts can leave an invalid txn if error was at SQLEndTran.
-            print(f"{ym}: staging/merge error: {e}", flush=True)
+            print(f"{ym}: staging cleanup error: {e}")
+            return 1
 
-    print(f"Ingest complete. Rows ingested: {total_rows}.", flush=True)
-    return 0 if total_rows > 0 else 0  # non-zero only if you want to fail when nothing found
+        staged_rows = 0
+        try:
+            staged_rows = stage_rows(
+                engine,
+                args.schema,
+                args.staging_table,
+                columns,
+                rows_iter,
+                chosen_url,
+            )
+        except Exception as e:
+            print(f"{ym}: staging error: {e}")
+            # Ensure stage is clean so next month isn't affected
+            with contextlib.suppress(Exception):
+                truncate_stage(engine, args.schema, args.staging_table)
+            continue
+
+        # 3) MERGE stage -> target with retries
+        merged = 0
+        last_err: Optional[Exception] = None
+        for attempt in range(1, SQL_RETRIES + 1):
+            try:
+                merged = merge_stage_into_target(engine, args.schema, args.staging_table, args.target_table)
+                last_err = None
+                break
+            except Exception as e:
+                last_err = e
+                print(f"  {ym}: merge attempt {attempt}/{SQL_RETRIES} failed: {e}")
+                time.sleep(SQL_RETRY_SLEEP)
+
+        if last_err:
+            print(f"{ym}: staging/merge error: {last_err}")
+            # Don't abort entire run; continue with next month
+            with contextlib.suppress(Exception):
+                truncate_stage(engine, args.schema, args.staging_table)
+            continue
+
+        # 4) Clean stage again (best-effort)
+        with contextlib.suppress(Exception):
+            truncate_stage(engine, args.schema, args.staging_table)
+
+        print(f"{ym}: staged {staged_rows:,} rows • merged {merged:,} rows.")
+        total_ingested += merged
+
+    print(f"Ingest complete. Rows ingested: {total_ingested:,}.")
+    return 0
+
 
 if __name__ == "__main__":
     sys.exit(main())
