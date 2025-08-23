@@ -7,3 +7,5 @@ sqlalchemy>=2
 pyodbc
 stream-read-xbrl
 requests
+beautifulsoup4
+lxml
